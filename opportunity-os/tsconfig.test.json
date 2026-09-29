@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": false, "outDir": ".test-build", "types": ["node"], "rootDir": "." },
+  "include": ["src/core/**/*.ts", "src/worker/**/*.ts", "tests/**/*.ts"]
+}

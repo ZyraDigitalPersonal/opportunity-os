@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpportunityOS</title>
+  <meta name="robots" content="noindex, nofollow">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js" defer></script>
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Navegación">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>OpportunityOS</span></div>
+      <a class="nav-item" href="#/" data-nav="explore">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        Explorar mercado
+      </a>
+      <a class="nav-item" href="#/ajustes" data-nav="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+        Integraciones
+      </a>
+      <div class="sidebar-foot">
+        <button class="icon-btn" id="theme-toggle" type="button" aria-label="Cambiar tema">Tema</button>
+        <a class="icon-btn" href="/logout">Salir</a>
+      </div>
+    </aside>
+    <main id="app" tabindex="-1"></main>
+  </div>
+</body>
+</html>
