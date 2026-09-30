@@ -1,0 +1,6 @@
+# Copia este archivo como .dev.vars para desarrollo local (wrangler dev). No lo subas a GitHub.
+APP_PASSWORD=elige-una-contraseña-larga
+SESSION_SECRET=pega-aqui-32-o-mas-caracteres-aleatorios
+CONTACT_EMAIL=tu-email-de-contacto@ejemplo.com
+ANTHROPIC_API_KEY=
+GOOGLE_PLACES_API_KEY=
