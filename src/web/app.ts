@@ -11,10 +11,11 @@ interface SearchResult {
   opportunities: Opportunity[];
 }
 interface SearchResponse {
-  parsed: { raw: string; sectorIds: string[]; sectorsFromIntent: boolean; location?: string; postcode?: string; intents: string[] };
+  parsed: { raw: string; sectorIds: string[]; sectorsFromIntent: boolean; keyword?: string; location?: string; postcode?: string; intents: string[] };
   area: GeoArea;
   results: SearchResult[];
-  meta: { total: number; cacheHit: boolean; attribution: string; costEur: number };
+  warnings?: string[];
+  meta: { total: number; cacheHit: boolean; attribution: string; costEur: number; costUsd?: number; sources?: string[]; source?: string; googleCalls?: number };
 }
 interface ApiError extends Error {
   status?: number;
@@ -22,12 +23,12 @@ interface ApiError extends Error {
 }
 
 const EXAMPLES = [
-  "Peluquerías en Lleida que necesitan automatización",
-  "Clínicas dentales en Girona",
-  "Restaurantes en Tarragona sin web",
+  "Clínicas dentales en Lleida",
+  "Restaurantes en Santa Cruz de Tenerife sin web",
+  "Peluquerías en La Laguna",
+  "Talleres mecánicos en Las Palmas de Gran Canaria",
   "Negocios en Lleida que puedan necesitar agentes de IA",
-  "Talleres mecánicos en Reus",
-  "Inmobiliarias en Zaragoza",
+  "Inmobiliarias en Adeje",
 ];
 
 const OPP_FILTERS: Array<[string, string]> = [
@@ -40,6 +41,10 @@ const OPP_FILTERS: Array<[string, string]> = [
   ["chatbot", "Chatbot"],
   ["crm", "CRM"],
   ["leads", "Captación de leads"],
+  ["automation", "Automatizaciones"],
+  ["reviews", "Reseñas / reputación"],
+  ["seo", "SEO local"],
+  ["fix_web", "Web caída"],
 ];
 
 const state = {
@@ -52,7 +57,7 @@ const state = {
   batch: null as null | { done: number; total: number },
   map: null as any,
   markers: new Map<string, any>(),
-  config: null as null | { integrations: { openStreetMap: boolean; googlePlaces: boolean; ai: boolean; aiProvider: string | null }; missing: string[]; rulesVersion: string },
+  config: null as null | { integrations: { openStreetMap: boolean; contactEmail?: boolean; googlePlaces: boolean; googleMaxCalls?: number; ai: boolean; aiProvider: string | null }; missing: string[]; rulesVersion: string },
 };
 
 // ---------- Utilidades ----------
@@ -188,7 +193,9 @@ async function search(q: string) {
   const btn = $("#search-btn") as HTMLButtonElement | null;
   if (btn) btn.disabled = true;
   try {
-    state.data = await api<SearchResponse>("/api/search", { q, limit: 80 });
+    state.data = await api<SearchResponse>("/api/search", { q, limit: 300 });
+    state.analyses.clear();
+    state.filters.minScore = 0;
     storage()?.setItem("oos-last", JSON.stringify(state.data));
   } catch (e) {
     state.error = e as ApiError;
@@ -219,7 +226,7 @@ function renderResultsArea() {
   const area = $("#results-area");
   if (!area) return;
   if (state.loading) {
-    area.innerHTML = `<div class="toolbar"><div class="summary">Buscando empresas en OpenStreetMap…</div></div><div class="results">${'<div class="skeleton"></div>'.repeat(5)}</div>`;
+    area.innerHTML = `<div class="toolbar"><div class="summary">Buscando negocios en Google Maps y OpenStreetMap… (en zonas grandes puede tardar hasta 30 s)</div></div><div class="results">${'<div class="skeleton"></div>'.repeat(5)}</div>`;
     return;
   }
   if (state.error) {
@@ -227,28 +234,32 @@ function renderResultsArea() {
     return;
   }
   if (!state.data) {
-    area.innerHTML = `<div class="notice" style="margin-top:24px">Escribe un sector y una zona. Los datos salen de OpenStreetMap; al pulsar <b>Analizar oportunidad</b> se revisa la web pública de cada negocio para confirmar las señales.</div>`;
+    area.innerHTML = `<div class="notice" style="margin-top:24px">Escribe qué tipo de negocio buscas y dónde: <b>«dentistas Lleida»</b>, <b>«restaurantes de Tenerife»</b>, <b>«peluquerías en La Laguna sin web»</b>. Los negocios salen de Google Maps y OpenStreetMap; al pulsar <b>Analizar oportunidad</b> se revisa la web de cada uno para confirmar qué le falta (web, reservas, chatbot, agente de voz, automatizaciones…).</div>`;
     return;
   }
   const d = state.data;
   const sectorsNote = d.parsed.sectorsFromIntent ? ` · sectores elegidos por la intención de la búsqueda` : "";
+  const src = d.meta.source || d.meta.sources?.join(" + ") || "OpenStreetMap";
+  const cost = d.meta.costUsd ? ` · ≈ ${d.meta.costUsd.toFixed(2)} US$ de Google (${d.meta.googleCalls} consultas)` : " · coste 0 €";
+  const warn = (d.warnings ?? []).map((w) => `<div class="notice" style="margin-top:10px">${esc(w)}</div>`).join("");
   area.innerHTML = `
     <div class="toolbar">
-      <div class="summary"><strong>${d.results.length}</strong> empresas en <strong>${esc(d.area.label)}</strong>${sectorsNote} · fuente OpenStreetMap · coste 0 €</div>
+      <div class="summary"><strong>${d.results.length}</strong> empresas en <strong>${esc(d.area.label)}</strong>${sectorsNote} · fuente ${esc(src)}${cost}</div>
       <div class="filters">
         <label>Score mín. <input type="range" id="f-min" min="0" max="90" step="5" value="${state.filters.minScore}"> <span class="mono" id="f-min-v">${state.filters.minScore}</span></label>
         <label class="sr-only" for="f-opp">Oportunidad</label>
         <select id="f-opp">${OPP_FILTERS.map(([v, l]) => `<option value="${v}"${state.filters.opp === v ? " selected" : ""}>${l}</option>`).join("")}</select>
         <label class="sr-only" for="f-sort">Orden</label>
         <select id="f-sort"><option value="score"${state.filters.sort === "score" ? " selected" : ""}>Mayor score</option><option value="name"${state.filters.sort === "name" ? " selected" : ""}>Nombre</option></select>
-        <button class="btn btn-sm" id="batch-btn" type="button" title="Revisa la web de las 10 primeras con web registrada">Analizar top 10</button>
+        <button class="btn btn-sm" id="batch-btn" type="button" title="Revisa la web de las 20 primeras con web registrada">Analizar top 20</button>
         <button class="btn btn-sm btn-ghost" id="csv-btn" type="button">Exportar CSV</button>
       </div>
     </div>
+    ${warn}
     <div id="batch-progress"></div>
     <div class="split">
       <div class="results" id="results"></div>
-      <div class="map-wrap"><div id="map"></div><div class="map-note">© OpenStreetMap · OpenFreeMap</div></div>
+      <div class="map-wrap"><div id="map"></div><div class="map-note">Mapa © OpenStreetMap · OpenFreeMap</div></div>
     </div>`;
 
   $("#f-min")!.addEventListener("input", (e) => {
@@ -272,7 +283,8 @@ function renderResultsArea() {
 
 function presenceBadges(c: Company): string {
   const b = (on: boolean, label: string) => `<span class="badge ${on ? "on" : "off"}">${label}</span>`;
-  return `<div class="presence">${b(!!c.website, "Web")}${b(!!c.phone, "Teléfono")}${b(!!(c.instagram || c.facebook), "Redes")}${b(!!c.openingHours, "Horario")}${c.whatsapp ? b(true, "WhatsApp") : ""}</div>`;
+  const stars = c.rating !== undefined ? `<span class="badge on" title="Google Maps">${c.rating.toFixed(1)} ★ · ${c.reviews ?? 0}</span>` : "";
+  return `<div class="presence">${b(!!c.website, "Web")}${b(!!c.phone, "Teléfono")}${b(!!(c.instagram || c.facebook), "Redes")}${b(!!c.openingHours, "Horario")}${c.whatsapp ? b(true, "WhatsApp") : ""}${stars}</div>`;
 }
 
 function cardHtml(r: SearchResult): string {
@@ -287,7 +299,7 @@ function cardHtml(r: SearchResult): string {
   return `<article class="card${state.activeId === c.id ? " is-active" : ""}" data-id="${esc(c.id)}">
     <div>
       <h3>${esc(c.name)}</h3>
-      <div class="meta">${esc(c.sectorLabel)}${c.address ? ` · ${esc(c.address)}` : ""}${c.city ? ` · ${esc(c.city)}` : ""}</div>
+      <div class="meta">${esc(c.sectorLabel)}${c.address ? ` · ${esc(c.address)}` : ""}${c.city ? ` · ${esc(c.city)}` : ""}${c.phone ? ` · <a href="tel:${esc(c.phone.replace(/\s/g, ""))}">${esc(c.phone)}</a>` : ""}</div>
       <div style="margin:6px 0">${presenceBadges(c)}</div>
       <div class="reco">Solución: <b>${esc(cur.recommended)}</b> ${status}</div>
       <ul class="reasons">${reasons.map((i) => `<li>${esc(i.reason)}</li>`).join("")}</ul>
@@ -305,7 +317,7 @@ function renderCards() {
   const el = $("#results");
   if (!el) return;
   const list = visibleResults();
-  el.innerHTML = list.length ? list.map(cardHtml).join("") : `<div class="empty">Ninguna empresa cumple los filtros. ${state.data?.results.length ? "Baja el score mínimo o cambia la oportunidad." : "Prueba con otra zona o sector: OpenStreetMap no tiene todos los negocios."}</div>`;
+  el.innerHTML = list.length ? list.map(cardHtml).join("") : `<div class="empty">Ninguna empresa cumple los filtros. ${state.data?.results.length ? "Baja el score mínimo o cambia la oportunidad." : "Prueba con otra zona o con otra forma de nombrar el sector."}</div>`;
   el.querySelectorAll<HTMLButtonElement>("[data-analyze]").forEach((b) => b.addEventListener("click", () => analyzeOne(b.dataset.analyze!, b)));
   el.querySelectorAll<HTMLElement>(".card").forEach((card) =>
     card.addEventListener("mouseenter", () => {
@@ -340,7 +352,7 @@ async function batchAnalyze() {
   if (!state.data || state.batch) return;
   const pending = visibleResults()
     .filter((r) => r.company.website && !state.analyses.has(r.company.id))
-    .slice(0, 10);
+    .slice(0, 20);
   if (!pending.length) return;
   state.batch = { done: 0, total: pending.length };
   const prog = $("#batch-progress")!;
@@ -367,7 +379,7 @@ async function batchAnalyze() {
 
 function exportCsv() {
   const rows = visibleResults();
-  const header = ["Nombre", "Sector", "Dirección", "Ciudad", "CP", "Teléfono", "Web", "Email", "Horario", "Instagram", "Facebook", "Opportunity Score", "Analizada", "Solución recomendada", "Motivos", "Fuente"];
+  const header = ["Nombre", "Sector", "Dirección", "Ciudad", "CP", "Teléfono", "Web", "Email", "Horario", "Instagram", "Facebook", "Valoración Google", "Reseñas", "Opportunity Score", "Analizada", "Solución recomendada", "Motivos", "Fuente"];
   const cell = (v: unknown) => {
     const s = String(v ?? "");
     const safe = /^[=+\-@]/.test(s) ? `'${s}` : s; // evita fórmulas al abrir en Excel
@@ -376,7 +388,7 @@ function exportCsv() {
   const lines = rows.map((r) => {
     const c = r.company;
     const cur = currentResult(r);
-    return [c.name, c.sectorLabel, c.address, c.city, c.postcode, c.phone, c.website, c.email, c.openingHours, c.instagram, c.facebook, cur.score.score, cur.analyzed ? "sí" : "no", cur.recommended, cur.score.items.map((i) => i.reason).join(" | "), c.sourceUrl].map(cell).join(";");
+    return [c.name, c.sectorLabel, c.address, c.city, c.postcode, c.phone, c.website, c.email, c.openingHours, c.instagram, c.facebook, c.rating?.toFixed(1), c.reviews, cur.score.score, cur.analyzed ? "sí" : "no", cur.recommended, cur.score.items.map((i) => i.reason).join(" | "), c.sourceUrl].map(cell).join(";");
   });
   const blob = new Blob(["﻿" + [header.map(cell).join(";"), ...lines].join("\r\n")], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");
@@ -506,7 +518,7 @@ function profileHtml(c: Company, a: Analysis | null, r: SearchResult): string {
     .join("");
 
   const auditHtml = !c.website
-    ? `<p class="muted">No se ha encontrado web en OpenStreetMap. Puede tenerla igualmente: compruébalo en la ficha de Google.</p>`
+    ? `<p class="muted">No se ha encontrado web en ${c.source === "Google" ? "su ficha de Google Maps" : "OpenStreetMap"}. Puede tenerla igualmente.</p>`
     : !audit
       ? `<p class="muted">Pendiente de revisar.</p>`
       : audit.blockedByRobots
@@ -560,12 +572,13 @@ function profileHtml(c: Company, a: Analysis | null, r: SearchResult): string {
         <dt>Horario</dt><dd>${esc(c.openingHours ?? "") || "No publicado"}</dd>
         <dt>Redes</dt><dd>${[c.instagram && `<a href="${safeHref(c.instagram)}" target="_blank" rel="noopener noreferrer">Instagram</a>`, c.facebook && `<a href="${safeHref(c.facebook)}" target="_blank" rel="noopener noreferrer">Facebook</a>`].filter(Boolean).join(" · ") || "No registradas"}</dd>
         <dt>Coordenadas</dt><dd class="mono">${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}</dd>
-        <dt>Fuente</dt><dd><a href="${safeHref(c.sourceUrl)}" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> (ODbL)</dd>
+        ${c.rating !== undefined ? `<dt>Google</dt><dd><span class="stars">${c.rating.toFixed(1)}</span> · ${c.reviews ?? 0} reseñas</dd>` : ""}
+        <dt>Fuente</dt><dd><a href="${safeHref(c.sourceUrl)}" target="_blank" rel="noopener noreferrer">${c.source === "Google" ? "Google Maps" : "OpenStreetMap"}</a>${c.source === "Google" ? "" : " (ODbL)"}${c.alsoIn ? ` · también en ${esc(c.alsoIn)}` : ""}</dd>
       </dl></div>
       <div class="panel"><h2>Presencia digital</h2>${auditHtml}</div>
       <div class="panel" id="google-panel"><h2>Ficha de Google</h2>
         <p class="muted" style="margin:0 0 10px">Valoración, reseñas y horario en vivo. No se guarda (términos de Google). Coste aprox. 0,035 US$ por consulta; las primeras 1.000 al mes son gratis.</p>
-        <button class="btn btn-sm" id="google-btn" type="button">Cargar ficha de Google</button><div id="google-out"></div>
+        <button class="btn btn-sm" id="google-btn" type="button">${c.source === "Google" ? "Ver horario y estado en Google" : "Cargar ficha de Google"}</button><div id="google-out"></div>
       </div>
       <div class="panel"><h2>Señales</h2><ul class="signals">${(a?.signals ?? []).map(signalRow).join("") || `<li class="muted">Calculando…</li>`}</ul></div>
     </div>
@@ -651,8 +664,9 @@ async function renderSettings() {
     const row = (ok: boolean, name: string, desc: string, variable: string) =>
       `<li><div><span class="dot${ok ? " ok" : ""}"></span><strong>${name}</strong><div class="muted" style="font-size:13px;margin-left:16px">${desc}</div></div><div class="muted" style="font-size:12.5px;text-align:right">${ok ? "Configurado" : `Falta <code class="mono">${variable}</code>`}</div></li>`;
     $("#cfg")!.innerHTML = `<ul class="status-list">
-      ${row(i.openStreetMap, "OpenStreetMap", "Búsqueda de empresas y zonas. Gratis. Exige un email de contacto.", "CONTACT_EMAIL")}
-      ${row(i.googlePlaces, "Google Places (ficha en vivo)", "Valoración, reseñas y horario al abrir una empresa. No se almacena.", "GOOGLE_PLACES_API_KEY")}
+      ${row(i.googlePlaces, "Google Maps (Places API)", `Fuente principal: encuentra prácticamente todos los negocios de la zona, con teléfono, web, valoración y reseñas. Hasta ${i.googleMaxCalls ?? 12} consultas por búsqueda (≈ 0,035 US$ cada una; 1.000 gratis al mes).`, "GOOGLE_PLACES_API_KEY")}
+      ${row(true, "OpenStreetMap", "Zonas y negocios gratis. Completa los datos de Google (email, redes). Siempre activo.", "")}
+      ${row(!!i.contactEmail, "Email de contacto (opcional)", "Recomendado por la política de uso de OpenStreetMap. Sin él, la búsqueda funciona igual.", "CONTACT_EMAIL")}
       ${row(i.ai, `IA${i.aiProvider ? ` · ${esc(i.aiProvider)}` : ""}`, "Propuestas, emails, WhatsApp, LinkedIn y guiones de llamada.", "ANTHROPIC_API_KEY")}
     </ul><p class="muted" style="margin-top:14px;font-size:13px">Reglas del Opportunity Engine: versión <span class="mono">${esc(state.config!.rulesVersion)}</span>.</p>`;
   } catch (e) {

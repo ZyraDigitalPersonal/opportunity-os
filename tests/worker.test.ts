@@ -135,3 +135,36 @@ test("login: bloquea tras 8 intentos fallidos", async () => {
   for (let i = 0; i < 9; i++) last = await worker.fetch(new Request("https://app.test/login", { method: "POST", headers, body: new URLSearchParams({ password: "mal" }) }), env, ctx);
   assert.match(await last!.text(), /Demasiados intentos/);
 });
+
+test("búsqueda con Google: une fuentes y avisa si OSM falla", async () => {
+  const cookie = await login();
+  const googleCompanies: Company[] = [
+    { id: "gp:ChIJabcdefghij", name: "Clínica Google", sectorId: "clinica_dental", sectorLabel: "Clínica dental", lat: 41.6, lon: 0.62, phone: "973", rating: 4.8, reviews: 12, source: "Google", sourceUrl: "https://maps.google.com/?cid=1" },
+  ];
+  const envG: Env = {
+    ...env,
+    __deps: {
+      data: { geocodeArea: async () => area, searchCompanies: async () => { throw new Error("overpass caído"); } },
+      google: { searchCompanies: async () => ({ companies: googleCompanies, calls: 2, truncated: false }) },
+      fetchImpl: fakeFetch,
+      cache: null,
+    },
+  };
+  const res = await worker.fetch(new Request("https://app.test/api/search", { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify({ q: "clinica dental lleida" }) }), envG, ctx);
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as any;
+  assert.equal(data.results.length, 1);
+  assert.equal(data.results[0].company.source, "Google");
+  assert.ok(data.warnings.some((w: string) => /OpenStreetMap/.test(w)));
+  assert.equal(data.meta.googleCalls, 2);
+
+  // La ficha de Google se puede analizar
+  const an = await worker.fetch(new Request("https://app.test/api/analyze", { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify({ company: data.results[0].company }) }), envG, ctx);
+  assert.equal(an.status, 200);
+});
+
+test("búsqueda sin CONTACT_EMAIL ya no se bloquea", async () => {
+  const cookie = await login();
+  const res = await worker.fetch(new Request("https://app.test/api/search", { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify({ q: "Peluquerías en Lleida" }) }), { ...env, CONTACT_EMAIL: undefined }, ctx);
+  assert.equal(res.status, 200);
+});

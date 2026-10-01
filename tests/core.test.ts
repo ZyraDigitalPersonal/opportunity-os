@@ -62,7 +62,7 @@ test("osm: área de relación y consulta Overpass", () => {
   assert.deepEqual(area.bbox, [41.5, 0.5, 41.7, 0.7]);
   const q = buildOverpassQuery(area, [getSector("peluqueria")!], 50);
   assert.match(q, /area\(3600341409\)->\.a;/);
-  assert.match(q, /nwr\["shop"~"\^hairdresser\$"\]\["name"\]\(area\.a\);/);
+  assert.match(q, /nwr\["shop"="hairdresser"\]\["name"\]\(area\.a\);/);
 });
 
 test("osm: convierte elementos, normaliza web y deduplica", () => {
@@ -204,3 +204,109 @@ test("IA: sin clave devuelve la variable que falta", () => {
   const p = createProvider({ ANTHROPIC_API_KEY: "k" });
   assert.ok("generate" in p && p.model === "claude-sonnet-5-5");
 });
+
+// ---------- Parser: formas reales de escribir ----------
+
+test("parser: variantes reales de búsqueda", () => {
+  const cases: Array<[string, string, string]> = [
+    ["clinica dental lleida", "clinica_dental", "lleida"],
+    ["Lleida dentistas", "clinica_dental", "Lleida"],
+    ["restaurantes de Tenerife", "restaurante", "Tenerife"],
+    ["Restaurantes en Santa Cruz de Tenerife", "restaurante", "Santa Cruz de Tenerife"],
+    ["gimnasios en La Laguna", "gimnasio", "La Laguna"],
+    ["Talleres mecánicos en Reus", "taller", "Reus"],
+  ];
+  for (const [q, sector, loc] of cases) {
+    const p = parseQuery(q);
+    assert.deepEqual(p.sectorIds, [sector], q);
+    assert.equal(p.location, loc, q);
+  }
+});
+
+test("parser: sector libre y sector con matiz", () => {
+  assert.deepEqual(parseQuery("escape rooms en Barcelona").sectorIds, ["custom:escape room"]);
+  const p = parseQuery("tiendas de drones en Madrid");
+  assert.deepEqual(p.sectorIds, ["custom:tienda de drones"]);
+  assert.equal(p.location, "Madrid");
+});
+
+test("parser: zona larga con alternativas", () => {
+  const p = parseQuery("restaurantes en el sur de Tenerife");
+  assert.ok(p.alternatives.some((a) => a.location === "Tenerife"));
+});
+
+// ---------- Google Places ----------
+
+import { GooglePlacesSearch, quadrants } from "../src/core/google-search.js";
+import { mergeCompanies } from "../src/core/merge.js";
+
+function gPlace(i: number, extra: Record<string, unknown> = {}) {
+  return { id: `ChIJplace${String(i).padStart(6, "0")}`, displayName: { text: `Clínica ${i}` }, location: { latitude: 41.6 + i / 10000, longitude: 0.62 }, formattedAddress: `Calle ${i}, Lleida`, rating: 4.5, userRatingCount: 10 + i, googleMapsUri: `https://maps.google.com/?cid=${i}`, ...extra };
+}
+
+test("google: pagina, subdivide la zona si sale llena y respeta el presupuesto", async () => {
+  let calls = 0;
+  const bodies: any[] = [];
+  const fakeFetch: typeof fetch = async (_u, init) => {
+    calls++;
+    const body = JSON.parse(String(init!.body));
+    bodies.push(body);
+    // La zona completa siempre devuelve 3 páginas llenas (60); los cuadrantes, 5 negocios distintos
+    const isFull = body.locationRestriction.rectangle.low.latitude === 41.5 && body.locationRestriction.rectangle.high.latitude === 41.7 && body.locationRestriction.rectangle.low.longitude === 0.5 && body.locationRestriction.rectangle.high.longitude === 0.7;
+    if (isFull) {
+      const page = body.pageToken ? Number(body.pageToken) : 0;
+      const places = Array.from({ length: 20 }, (_, k) => gPlace(page * 20 + k));
+      return new Response(JSON.stringify({ places, nextPageToken: page < 2 ? String(page + 1) : undefined }));
+    }
+    const base = 1000 + calls * 10;
+    return new Response(JSON.stringify({ places: Array.from({ length: 5 }, (_, k) => gPlace(base + k)) }));
+  };
+  const g = new GooglePlacesSearch({ apiKey: "k", maxCalls: 5, fetchImpl: fakeFetch });
+  const r = await g.searchCompanies(area0(), [getSector("clinica_dental")!], 500);
+  assert.equal(r.calls, 5);
+  assert.equal(r.companies.length, 70); // 60 + 2 cuadrantes × 5
+  assert.equal(r.truncated, true);
+  assert.equal(bodies[0].textQuery, "clínica dental");
+  assert.equal(r.companies[0].source, "Google");
+  assert.match(r.companies[0].id, /^gp:/);
+});
+
+test("google: descarta cerrados y no toma Instagram como web", async () => {
+  const fakeFetch: typeof fetch = async () =>
+    new Response(JSON.stringify({ places: [gPlace(1, { businessStatus: "CLOSED_PERMANENTLY" }), gPlace(2, { websiteUri: "https://instagram.com/clinica2" }), gPlace(3, { websiteUri: "https://clinica3.es" })] }));
+  const r = await new GooglePlacesSearch({ apiKey: "k", maxCalls: 3, fetchImpl: fakeFetch }).searchCompanies(area0(), [getSector("clinica_dental")!], 100);
+  assert.equal(r.companies.length, 2);
+  assert.equal(r.companies[0].website, undefined);
+  assert.equal(r.companies[0].instagram, "https://instagram.com/clinica2");
+  assert.equal(r.companies[1].website, "https://clinica3.es");
+});
+
+test("google: errores con mensaje claro", async () => {
+  const fakeFetch: typeof fetch = async () => new Response(JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "Places API (New) has not been used in project 1 before or it is disabled" } }), { status: 403 });
+  await assert.rejects(new GooglePlacesSearch({ apiKey: "k", maxCalls: 3, fetchImpl: fakeFetch }).searchCompanies(area0(), [getSector("clinica_dental")!], 100), /no está activada/);
+});
+
+test("quadrants cubre el rectángulo", () => {
+  const q = quadrants([0, 0, 2, 2]);
+  assert.deepEqual(q, [[0, 0, 1, 1], [0, 1, 1, 2], [1, 0, 2, 1], [1, 1, 2, 2]]);
+});
+
+test("merge: une Google y OSM sin duplicar y completa datos", () => {
+  const g: Company = { id: "gp:ChIJabcdefghij", name: "Clínica Dental Sonrisa", sectorId: "clinica_dental", sectorLabel: "Clínica dental", lat: 41.6, lon: 0.62, source: "Google", sourceUrl: "https://maps.google.com/?cid=1" };
+  const o1: Company = { id: "osm:node/1", name: "Clinica Dental Sonrisa S.L.", sectorId: "clinica_dental", sectorLabel: "Clínica dental", lat: 41.6005, lon: 0.6201, email: "info@sonrisa.es", source: "OpenStreetMap", sourceUrl: "x" };
+  const o2: Company = { id: "osm:node/2", name: "Dentista Otro", sectorId: "clinica_dental", sectorLabel: "Clínica dental", lat: 41.61, lon: 0.63, source: "OpenStreetMap", sourceUrl: "y" };
+  const m = mergeCompanies([g], [o1, o2]);
+  assert.equal(m.length, 2);
+  assert.equal(m[0].email, "info@sonrisa.es");
+  assert.equal(m[0].alsoIn, "OpenStreetMap");
+});
+
+test("engine: reseñas de Google generan oportunidad de reputación", () => {
+  const c: Company = { id: "gp:ChIJabcdefghij", name: "Bar Malo", sectorId: "restaurante", sectorLabel: "Restaurante", lat: 1, lon: 1, phone: "922", website: "https://x.es", rating: 3.6, reviews: 80, source: "Google", sourceUrl: "https://maps.google.com/?cid=1" };
+  const a = analyzeCompany(c);
+  assert.ok(a.opportunities.some((o) => o.id === "reviews" && o.priority === "media"));
+});
+
+function area0() {
+  return { label: "Lleida", overpassAreaId: 3600341409, bbox: [41.5, 0.5, 41.7, 0.7] as [number, number, number, number], center: [41.61, 0.62] as [number, number] };
+}

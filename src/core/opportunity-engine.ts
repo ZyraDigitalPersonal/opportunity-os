@@ -2,9 +2,9 @@
 // Determinista y sin IA: cada punto sale de una señal con su fuente y su nivel de confianza.
 
 import type { Analysis, Company, Opportunity, OpportunityScore, Priority, ScoreItem, Signal, WebAudit } from "./types.js";
-import { getSector, type SectorProfile } from "./sectors.js";
+import { resolveSector, type SectorProfile } from "./sectors.js";
 
-export const RULES_VERSION = "2026-09-29.1";
+export const RULES_VERSION = "2026-10-01.1";
 const SLOW_MS = 3000;
 
 const DIMENSION_CAPS: Record<ScoreItem["dimension"], number> = {
@@ -17,17 +17,24 @@ const DIMENSION_CAPS: Record<ScoreItem["dimension"], number> = {
 
 export function extractSignals(c: Company, audit: WebAudit | undefined, sector: SectorProfile, now = new Date()): Signal[] {
   const s: Signal[] = [];
-  const osm = "OpenStreetMap";
+  const osm = c.source === "Google" ? "Google Maps" : "OpenStreetMap";
   const web = "Web de la empresa";
   const prof = "Perfil del sector";
 
   if (c.website) s.push({ key: "has_website", label: "Tiene web registrada", confidence: "verificado", source: osm, evidence: c.website });
-  else s.push({ key: "no_website_found", label: "No se ha encontrado web en las fuentes consultadas", confidence: "inferido", source: osm, evidence: "OpenStreetMap no registra web; podría tenerla igualmente" });
+  else s.push({ key: "no_website_found", label: "No se ha encontrado web en las fuentes consultadas", confidence: "inferido", source: osm, evidence: `${osm} no registra web; podría tenerla igualmente` });
   if (c.phone) s.push({ key: "has_phone", label: "Teléfono publicado", confidence: "verificado", source: osm, evidence: c.phone });
   if (c.email) s.push({ key: "has_email", label: "Email de empresa publicado", confidence: "verificado", source: osm, evidence: c.email });
   if (c.openingHours) s.push({ key: "has_hours", label: "Horario publicado", confidence: "verificado", source: osm, evidence: c.openingHours });
   if (c.instagram || c.facebook) s.push({ key: "osm_social", label: "Redes sociales registradas", confidence: "verificado", source: osm, evidence: [c.instagram, c.facebook].filter(Boolean).join(" · ") });
   if (c.whatsapp) s.push({ key: "osm_whatsapp", label: "WhatsApp publicado", confidence: "verificado", source: osm, evidence: c.whatsapp });
+  if (c.rating !== undefined) {
+    const ev = `${c.rating.toFixed(1)} ★ · ${c.reviews ?? 0} reseñas`;
+    if (c.rating < 4.2 && (c.reviews ?? 0) >= 5) s.push({ key: "low_rating", label: `Valoración mejorable en Google (${c.rating.toFixed(1)} ★)`, confidence: "verificado", source: "Google Maps", evidence: ev });
+    else s.push({ key: "google_rating", label: `Valoración en Google: ${c.rating.toFixed(1)} ★`, confidence: "verificado", source: "Google Maps", evidence: ev });
+  }
+  if (c.source === "Google" && (c.reviews ?? 0) < 25) s.push({ key: "few_reviews", label: `Pocas reseñas en Google (${c.reviews ?? 0})`, confidence: "verificado", source: "Google Maps" });
+  if (c.source === "Google" && (c.reviews ?? 0) >= 150) s.push({ key: "busy_business", label: `Negocio con mucho movimiento (${c.reviews} reseñas)`, confidence: "verificado", source: "Google Maps" });
   if (c.reservation && /^(yes|required|recommended)$/.test(c.reservation)) s.push({ key: "takes_reservations", label: "Acepta o requiere reserva", confidence: "verificado", source: osm, evidence: `reservation=${c.reservation}` });
 
   if (audit) {
@@ -100,6 +107,9 @@ export function computeScore(signals: Signal[], sector: SectorProfile, audited: 
   if (has("has_hours")) add("Potencial comercial", 2, "has_hours");
   if (has("osm_social") || has("web_social")) add("Potencial comercial", 3, has("osm_social") ? "osm_social" : "web_social", "Activo en redes sociales");
   if (has("has_email") || has("web_email")) add("Potencial comercial", 2, has("has_email") ? "has_email" : "web_email");
+  if (has("busy_business")) add("Potencial comercial", 3, "busy_business", "Mucho volumen de clientes: más llamadas y reservas que automatizar");
+  if (has("low_rating")) add("Atención al cliente", 4, "low_rating");
+  if (has("few_reviews")) add("Presencia digital", 3, "few_reviews");
 
   // Encaje del sector
   add("Encaje del sector", sector.digitalFit, "sector_fit", `${sector.label}: encaje ${sector.digitalFit}/10 con soluciones de digitalización`);
@@ -175,6 +185,27 @@ export function detectOpportunities(signals: Signal[], sector: SectorProfile, c:
       ops.push({ id: "leads", title: "Captación de leads", priority: "media", problem: "La web no invita a contactar ni pedir presupuesto.", solution: "Formularios de presupuesto, CTA y seguimiento automático de cada contacto.", basedOn: ["no_form", "no_cta"] });
     }
   }
+  if (has("low_rating") || has("few_reviews")) {
+    ops.push({
+      id: "reviews",
+      title: "Reseñas y reputación en Google",
+      priority: has("low_rating") ? "media" : "baja",
+      problem: has("low_rating") ? `Valoración por debajo de la media del sector (${c.rating?.toFixed(1)} ★): pierde clientes que comparan en Google Maps.` : `Pocas reseñas en Google (${c.reviews ?? 0}): poca confianza frente a la competencia.`,
+      solution: "Petición automática de reseña tras cada servicio (WhatsApp/SMS), respuesta a reseñas con IA y ficha de Google optimizada.",
+      basedOn: [has("low_rating") ? "low_rating" : "few_reviews"],
+    });
+  }
+  const officeLike = sector.typicalNeeds.some((n) => /documento|presupuesto|factura|lead|gesti[oó]n de/i.test(n));
+  if (officeLike) {
+    ops.push({
+      id: "automation",
+      title: "Automatización de procesos",
+      priority: "media",
+      problem: "Tareas repetitivas (presupuestos, documentos, seguimiento de clientes) hechas a mano.",
+      solution: "Automatizaciones con IA: captura de leads, presupuestos y documentos automáticos, avisos y seguimiento conectados a su CRM o email.",
+      basedOn: ["sector_fit"],
+    });
+  }
   if (sector.recurringClients) {
     ops.push({ id: "crm", title: "CRM y fidelización", priority: "baja", problem: "Con clientes recurrentes, sin CRM se pierden seguimientos y ventas repetidas.", solution: "CRM sencillo con historial de cliente, campañas y avisos de seguimiento.", basedOn: ["recurring_clients"] });
   }
@@ -187,7 +218,7 @@ export function recommend(ops: Opportunity[]): string {
 }
 
 export function analyzeCompany(c: Company, audit?: WebAudit, now = new Date()): Analysis {
-  const sector = getSector(c.sectorId);
+  const sector = resolveSector(c.sectorId);
   if (!sector) throw new Error(`Sector desconocido: ${c.sectorId}`);
   const signals = extractSignals(c, audit, sector, now);
   const score = computeScore(signals, sector, !!audit);

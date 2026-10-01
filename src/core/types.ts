@@ -12,7 +12,7 @@ export interface GeoArea {
 }
 
 export interface Company {
-  id: string; // "osm:node/123"
+  id: string; // "osm:node/123" o "gp:<place_id>"
   name: string;
   sectorId: string;
   sectorLabel: string;
@@ -30,8 +30,14 @@ export interface Company {
   whatsapp?: string;
   /** Etiqueta OSM reservation=* (yes, required, no, recommended) */
   reservation?: string;
-  source: "OpenStreetMap";
+  source: "OpenStreetMap" | "Google";
   sourceUrl: string;
+  /** Solo resultados de Google (se muestran en vivo, no se guardan en servidor) */
+  rating?: number;
+  reviews?: number;
+  googleMapsUri?: string;
+  /** El negocio aparece también en otra fuente (OSM + Google) */
+  alsoIn?: string;
 }
 
 export interface Signal {
