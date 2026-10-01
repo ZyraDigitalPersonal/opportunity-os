@@ -71,11 +71,11 @@ export class RateLimiter {
 export const SECURITY_HEADERS: Record<string, string> = {
   "Content-Security-Policy": [
     "default-src 'self'",
-    "script-src 'self' https://unpkg.com",
+    "script-src 'self' https://unpkg.com https://maps.googleapis.com https://*.googleapis.com https://*.gstatic.com https://*.google.com",
     "style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data: blob: https:",
-    "connect-src 'self' https://tiles.openfreemap.org",
+    "connect-src 'self' https://tiles.openfreemap.org https://*.googleapis.com https://*.gstatic.com https://*.google.com data: blob:",
     "worker-src 'self' blob:",
     "child-src blob:",
     "frame-ancestors 'none'",

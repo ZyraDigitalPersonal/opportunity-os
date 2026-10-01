@@ -67,22 +67,63 @@ export class OpenAIProvider implements AIProvider {
   }
 }
 
+/** Binding de Cloudflare Workers AI (gratis hasta 10.000 «neuronas» al día). */
+export interface WorkersAIBinding {
+  run(model: string, input: Record<string, unknown>): Promise<any>;
+}
+
+export const WORKERS_AI_DEFAULT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+export class WorkersAIProvider implements AIProvider {
+  readonly name = "cloudflare";
+  constructor(private readonly ai: WorkersAIBinding, readonly model: string) {}
+  async generate(req: AIRequest): Promise<AIResponse> {
+    return this.chat(req.system, [{ role: "user", content: req.prompt }], req.maxTokens);
+  }
+  async chat(system: string, messages: ChatMessage[], maxTokens: number): Promise<AIResponse> {
+    let out: any;
+    try {
+      out = await this.ai.run(this.model, { messages: [{ role: "system", content: system }, ...messages], max_tokens: maxTokens, temperature: 0.4 });
+    } catch (e) {
+      const msg = (e as Error).message ?? "";
+      if (/4006|daily free allocation|neurons/i.test(msg)) throw new ExternalError("Se ha agotado la IA gratuita de hoy (Cloudflare Workers AI). Vuelve a intentarlo mañana o añade ANTHROPIC_API_KEY.", "workers-ai", 429);
+      throw new ExternalError(`La IA de Cloudflare no ha respondido: ${msg.slice(0, 160)}`, "workers-ai", 502);
+    }
+    const text = typeof out?.response === "string" ? out.response : typeof out?.result?.response === "string" ? out.result.response : "";
+    return { text: text.trim(), provider: this.name, model: this.model, inputTokens: out?.usage?.prompt_tokens ?? 0, outputTokens: out?.usage?.completion_tokens ?? 0 };
+  }
+}
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface AIEnv {
   AI_PROVIDER?: string;
   AI_MODEL?: string;
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
+  /** Binding de Workers AI: se usa gratis cuando no hay clave de pago */
+  AI?: WorkersAIBinding;
+  WORKERS_AI_MODEL?: string;
+}
+
+/** IA gratuita de Cloudflare si el binding está disponible. */
+export function freeProvider(env: AIEnv): WorkersAIProvider | null {
+  return env.AI ? new WorkersAIProvider(env.AI, env.WORKERS_AI_MODEL ?? WORKERS_AI_DEFAULT_MODEL) : null;
 }
 
 /** Devuelve el proveedor configurado o un mensaje claro de qué variable falta. */
 export function createProvider(env: AIEnv, f?: typeof fetch): AIProvider | { missing: string } {
   const provider = (env.AI_PROVIDER ?? "anthropic").toLowerCase();
+  if (provider === "cloudflare") return freeProvider(env) ?? { missing: "AI (binding de Workers AI)" };
   if (provider === "anthropic") {
-    if (!env.ANTHROPIC_API_KEY) return { missing: "ANTHROPIC_API_KEY" };
+    if (!env.ANTHROPIC_API_KEY) return freeProvider(env) ?? { missing: "ANTHROPIC_API_KEY" };
     return new AnthropicProvider(env.ANTHROPIC_API_KEY, env.AI_MODEL ?? "claude-sonnet-5-5", f);
   }
   if (provider === "openai") {
-    if (!env.OPENAI_API_KEY) return { missing: "OPENAI_API_KEY" };
+    if (!env.OPENAI_API_KEY) return freeProvider(env) ?? { missing: "OPENAI_API_KEY" };
     return new OpenAIProvider(env.OPENAI_API_KEY, env.AI_MODEL ?? "gpt-4.1-mini", f);
   }
   return { missing: `AI_PROVIDER (valor no soportado: ${provider})` };
@@ -136,10 +177,54 @@ export const MODEL_PRICES_USD_PER_MTOK: Record<string, [number, number]> = {
   "claude-sonnet-5-5": [3, 15],
   "claude-haiku-4-5-20251001": [1, 5],
   "gpt-4.1-mini": [0.4, 1.6],
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast": [0, 0],
 };
 
 export function estimateCostUsd(model: string, inputTokens: number, outputTokens: number): number | null {
   const p = MODEL_PRICES_USD_PER_MTOK[model];
   if (!p) return null;
   return (inputTokens * p[0] + outputTokens * p[1]) / 1_000_000;
+}
+
+// ---------- Asistente de ayuda ----------
+
+export const ZYRA_CONTACT = {
+  company: "ZYRA",
+  web: "https://digitalzyra.com",
+  contactPage: "https://digitalzyra.com/es-es/contacto/",
+  email: "zyradigitalpersonal@gmail.com",
+  phone: "+34 643 41 24 54",
+  whatsapp: "https://wa.me/34643412454",
+  instagram: "https://www.instagram.com/zyra_personal",
+  linkedin: "https://www.linkedin.com/in/digital-zyra-730293439",
+  tiktok: "https://www.tiktok.com/@digitalzyra",
+};
+
+export const ASSISTANT_SYSTEM = [
+  "Eres el asistente de OpportunityOS, una herramienta de ZYRA (agencia de digitalización en España).",
+  "Respondes en español de España, breve (máximo 120 palabras salvo que pidan detalle), claro y amable. Usa listas cortas cuando ayuden.",
+  "Solo hablas de OpportunityOS, de cómo usarlo y de captar clientes para servicios de digitalización. Si preguntan otra cosa, redirige con amabilidad.",
+  "Si no sabes algo, dilo y ofrece el contacto de ZYRA. No inventes funciones que no existen.",
+  "",
+  "QUÉ HACE OPPORTUNITYOS:",
+  "- Buscador: se escribe el tipo de negocio y la zona (\"dentistas Lleida\", \"restaurantes de Tenerife\", \"peluquerías en La Laguna sin web\"). Busca en Google Maps y OpenStreetMap y une los resultados sin duplicados.",
+  "- Cada negocio recibe un Opportunity Score (0-100): cuanto más alto, más le falta digitalizar. Cada punto tiene su motivo, marcado como verificado o inferido.",
+  "- Por defecto salen primero los negocios SIN web. Filtros rápidos: sin web, sin reservas online, pocas reseñas, con teléfono. Orden por score, reseñas o nombre.",
+  "- 'Analizar oportunidad' revisa la web pública del negocio: HTTPS, móvil, velocidad, reservas online, chat, WhatsApp, formularios, SEO básico.",
+  "- Oportunidades que detecta: página web, rediseño, reservas online, recordatorios, agente de voz IA para llamadas, chatbot, automatización de WhatsApp, automatización de procesos, CRM, SEO local, reseñas y reputación.",
+  "- Perfil de empresa: score explicado, oportunidades, datos de contacto y botón 'Generar con IA' para escribir propuesta, email, WhatsApp, LinkedIn o guion de llamada basados solo en datos reales.",
+  "- Exportar CSV (abre en Excel) con todos los datos y el score.",
+  "- Ajustes: servicios que ofrece tu agencia (resalta las oportunidades que vendes), orden por defecto, número de resultados por búsqueda y estado de las integraciones.",
+  "- Legal: no enviar emails ni WhatsApp comerciales a quien no lo haya autorizado (LSSI art. 21). La app redacta, no envía.",
+  "",
+  "COSTES:",
+  "- OpenStreetMap: gratis. IA del asistente y textos (Cloudflare Workers AI): gratis hasta el límite diario.",
+  "- Google Places: cada consulta trae hasta 20 negocios; 1.000 consultas gratis al mes, luego unos 35 US$ por 1.000. Mapa de Google: 10.000 cargas gratis al mes. Recomendado poner límites de cuota en Google Cloud para no pagar nunca.",
+  "",
+  `CONTACTO DE ZYRA (para soporte, dudas o contratar servicios): email ${ZYRA_CONTACT.email}, teléfono y WhatsApp ${ZYRA_CONTACT.phone}, web ${ZYRA_CONTACT.web}.`,
+].join("\n");
+
+/** Convierte una conversación en una sola petición para proveedores sin chat multi-turno. */
+export function flattenChat(messages: ChatMessage[]): string {
+  return messages.map((m) => `${m.role === "user" ? "Usuario" : "Asistente"}: ${m.content}`).join("\n\n") + "\n\nAsistente:";
 }

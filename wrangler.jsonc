@@ -10,6 +10,8 @@
     "run_worker_first": true
   },
   "observability": { "enabled": true },
+  // IA gratuita de Cloudflare (Workers AI): asistente de ayuda y textos comerciales sin clave de pago
+  "ai": { "binding": "AI" },
   "vars": {
     "AI_PROVIDER": "anthropic",
     "SENDER_NAME": "ZyraDigitalPersonal"

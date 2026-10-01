@@ -22,6 +22,69 @@ interface ApiError extends Error {
   missing?: string;
 }
 
+type SortKey = "agency" | "score" | "reviews" | "name";
+type QuickFilter = "all" | "noweb" | "nobooking" | "fewreviews" | "phone" | "mine";
+
+interface AppConfig {
+  integrations: { openStreetMap: boolean; contactEmail?: boolean; googlePlaces: boolean; googleMaxCalls?: number; googleMaps?: boolean; ai: boolean; aiFree?: boolean; aiProvider: string | null };
+  mapsKey?: string | null;
+  contact?: { company: string; web: string; contactPage: string; email: string; phone: string; whatsapp: string; instagram: string; linkedin: string; tiktok: string };
+  missing: string[];
+  rulesVersion: string;
+}
+
+/** Servicios que puede vender la agencia → ids de oportunidad del motor */
+const SERVICES: Array<[string, string, string[]]> = [
+  ["web", "Páginas web", ["new_web", "fix_web", "redesign"]],
+  ["booking", "Reservas y recordatorios", ["booking", "reminders"]],
+  ["voice", "Agentes de voz IA (llamadas)", ["voice_agent"]],
+  ["chatbot", "Chatbots IA", ["chatbot"]],
+  ["whatsapp", "Automatización de WhatsApp", ["whatsapp"]],
+  ["automation", "Automatizaciones", ["automation", "leads"]],
+  ["crm", "CRM y fidelización", ["crm"]],
+  ["seo", "SEO local", ["seo"]],
+  ["reviews", "Reseñas y reputación", ["reviews"]],
+];
+
+interface Settings {
+  agencyName: string;
+  services: string[];
+  sort: SortKey;
+  limit: number;
+}
+const DEFAULT_SETTINGS: Settings = { agencyName: "ZYRA", services: SERVICES.map(([id]) => id), sort: "agency", limit: 300 };
+
+function loadSettings(): Settings {
+  try {
+    const raw = localStorage.getItem("oos-settings");
+    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+  } catch {}
+  return { ...DEFAULT_SETTINGS };
+}
+function saveSettings(x: Settings) {
+  try {
+    localStorage.setItem("oos-settings", JSON.stringify(x));
+  } catch {}
+}
+function myOppIds(): Set<string> {
+  const sv = new Set(loadSettings().services);
+  return new Set(SERVICES.filter(([id]) => sv.has(id)).flatMap(([, , ops]) => ops));
+}
+
+function recentSearches(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem("oos-recent") ?? "[]").slice(0, 6);
+  } catch {
+    return [];
+  }
+}
+function pushRecent(q: string) {
+  try {
+    const list = [q, ...recentSearches().filter((x) => x.toLowerCase() !== q.toLowerCase())].slice(0, 6);
+    localStorage.setItem("oos-recent", JSON.stringify(list));
+  } catch {}
+}
+
 const EXAMPLES = [
   "Clínicas dentales en Lleida",
   "Restaurantes en Santa Cruz de Tenerife sin web",
@@ -53,11 +116,15 @@ const state = {
   activeId: null as string | null,
   loading: false,
   error: null as ApiError | null,
-  filters: { minScore: 0, opp: "", sort: "score" as "score" | "name" },
+  filters: { minScore: 0, opp: "", sort: loadSettings().sort as SortKey },
   batch: null as null | { done: number; total: number },
-  map: null as any,
-  markers: new Map<string, any>(),
-  config: null as null | { integrations: { openStreetMap: boolean; contactEmail?: boolean; googlePlaces: boolean; googleMaxCalls?: number; ai: boolean; aiProvider: string | null }; missing: string[]; rulesVersion: string },
+  map: null as MapAdapter | null,
+  mapNote: "",
+  config: null as null | AppConfig,
+  quick: "all" as QuickFilter,
+  shown: 60,
+  chat: [] as Array<{ role: "user" | "assistant"; content: string }>,
+  chatBusy: false,
 };
 
 // ---------- Utilidades ----------
@@ -146,6 +213,9 @@ function route() {
   } else if (h.startsWith("#/ajustes")) {
     $("[data-nav=settings]")?.setAttribute("aria-current", "page");
     renderSettings();
+  } else if (h.startsWith("#/ayuda")) {
+    $("[data-nav=help]")?.setAttribute("aria-current", "page");
+    renderHelp();
   } else {
     $("[data-nav=explore]")?.setAttribute("aria-current", "page");
     renderExplore();
@@ -193,9 +263,12 @@ async function search(q: string) {
   const btn = $("#search-btn") as HTMLButtonElement | null;
   if (btn) btn.disabled = true;
   try {
-    state.data = await api<SearchResponse>("/api/search", { q, limit: 300 });
+    state.data = await api<SearchResponse>("/api/search", { q, limit: loadSettings().limit });
     state.analyses.clear();
     state.filters.minScore = 0;
+    state.quick = "all";
+    state.shown = 60;
+    pushRecent(q);
     storage()?.setItem("oos-last", JSON.stringify(state.data));
   } catch (e) {
     state.error = e as ApiError;
@@ -212,14 +285,40 @@ function currentResult(r: SearchResult): { score: OpportunityScore; recommended:
   return a ? { score: a.score, recommended: a.recommended, opportunities: a.opportunities, analyzed: true } : { score: r.score, recommended: r.recommended, opportunities: r.opportunities, analyzed: false };
 }
 
+const hasBookingGap = (r: SearchResult) => currentResult(r).opportunities.some((o) => o.id === "booking");
+const fewReviews = (r: SearchResult) => r.company.reviews !== undefined && r.company.reviews < 25;
+const matchesMine = (r: SearchResult, mine: Set<string>) => currentResult(r).opportunities.some((o) => mine.has(o.id));
+
 function visibleResults(): SearchResult[] {
   if (!state.data) return [];
   const { minScore, opp, sort } = state.filters;
+  const mine = myOppIds();
+  const q = state.quick;
   const list = state.data.results.filter((r) => {
     const c = currentResult(r);
-    return c.score.score >= minScore && (!opp || c.opportunities.some((o) => o.id === opp));
+    if (c.score.score < minScore) return false;
+    if (opp && !c.opportunities.some((o) => o.id === opp)) return false;
+    if (q === "noweb" && r.company.website) return false;
+    if (q === "nobooking" && !hasBookingGap(r)) return false;
+    if (q === "fewreviews" && !fewReviews(r)) return false;
+    if (q === "phone" && !r.company.phone) return false;
+    if (q === "mine" && !matchesMine(r, mine)) return false;
+    return true;
   });
-  return list.sort((a, b) => (sort === "name" ? a.company.name.localeCompare(b.company.name, "es") : currentResult(b).score.score - currentResult(a).score.score));
+  const byScore = (a: SearchResult, b: SearchResult) => currentResult(b).score.score - currentResult(a).score.score;
+  return list.sort((a, b) => {
+    if (sort === "name") return a.company.name.localeCompare(b.company.name, "es");
+    if (sort === "reviews") return (b.company.reviews ?? -1) - (a.company.reviews ?? -1) || byScore(a, b);
+    if (sort === "agency") {
+      // Primero los que no tienen web (lo que más vende una agencia), luego los que tienen teléfono para llamar
+      const w = Number(!!a.company.website) - Number(!!b.company.website);
+      if (w) return w;
+      const p = Number(!b.company.phone) - Number(!a.company.phone);
+      if (p) return -p;
+      return byScore(a, b);
+    }
+    return byScore(a, b);
+  });
 }
 
 function renderResultsArea() {
@@ -234,7 +333,20 @@ function renderResultsArea() {
     return;
   }
   if (!state.data) {
-    area.innerHTML = `<div class="notice" style="margin-top:24px">Escribe qué tipo de negocio buscas y dónde: <b>«dentistas Lleida»</b>, <b>«restaurantes de Tenerife»</b>, <b>«peluquerías en La Laguna sin web»</b>. Los negocios salen de Google Maps y OpenStreetMap; al pulsar <b>Analizar oportunidad</b> se revisa la web de cada uno para confirmar qué le falta (web, reservas, chatbot, agente de voz, automatizaciones…).</div>`;
+    const recent = recentSearches();
+    area.innerHTML = `
+      ${recent.length ? `<div class="recent"><span class="muted">Búsquedas recientes:</span> ${recent.map((r) => `<button type="button" class="chip chip-soft" data-recent="${esc(r)}">${esc(r)}</button>`).join("")}</div>` : ""}
+      <div class="features">
+        <div class="feature"><span class="feature-n">1</span><h3>Encuentra</h3><p>Escribe tipo de negocio y zona: <b>«dentistas Lleida»</b>, <b>«restaurantes de Tenerife»</b>. Busca en Google Maps y OpenStreetMap a la vez.</p></div>
+        <div class="feature"><span class="feature-n">2</span><h3>Prioriza</h3><p>Primero salen los negocios <b>sin web</b>. Cada uno tiene un score de 0 a 100 con los motivos: sin reservas, pocas reseñas, web lenta…</p></div>
+        <div class="feature"><span class="feature-n">3</span><h3>Vende</h3><p>Abre el perfil y genera con IA la propuesta, el email, el WhatsApp o el guion de llamada con datos reales del negocio.</p></div>
+      </div>`;
+    area.querySelectorAll<HTMLButtonElement>("[data-recent]").forEach((b) =>
+      b.addEventListener("click", () => {
+        ($("#q") as HTMLInputElement).value = b.dataset.recent!;
+        search(b.dataset.recent!);
+      }),
+    );
     return;
   }
   const d = state.data;
@@ -242,7 +354,26 @@ function renderResultsArea() {
   const src = d.meta.source || d.meta.sources?.join(" + ") || "OpenStreetMap";
   const cost = d.meta.costUsd ? ` · ≈ ${d.meta.costUsd.toFixed(2)} US$ de Google (${d.meta.googleCalls} consultas)` : " · coste 0 €";
   const warn = (d.warnings ?? []).map((w) => `<div class="notice" style="margin-top:10px">${esc(w)}</div>`).join("");
+  const all = d.results;
+  const nNoWeb = all.filter((r) => !r.company.website).length;
+  const nNoBooking = all.filter(hasBookingGap).length;
+  const nFew = all.filter(fewReviews).length;
+  const nPhone = all.filter((r) => !!r.company.phone).length;
+  const mine = myOppIds();
+  const nMine = all.filter((r) => matchesMine(r, mine)).length;
+  const avg = all.length ? Math.round(all.reduce((x, r) => x + r.score.score, 0) / all.length) : 0;
+  const stat = (key: QuickFilter, n: number, label: string, hint: string) =>
+    `<button type="button" class="stat${state.quick === key ? " is-on" : ""}" data-quick="${key}" title="${esc(hint)}"><span class="stat-n">${n}</span><span class="stat-l">${label}</span></button>`;
   area.innerHTML = `
+    <div class="stats" role="group" aria-label="Filtros rápidos">
+      ${stat("all", all.length, "Negocios", "Ver todos")}
+      ${stat("noweb", nNoWeb, "Sin web", "Negocios sin página web registrada")}
+      ${stat("nobooking", nNoBooking, "Sin reservas online", "Trabajan con citas y no tienen reserva online")}
+      ${stat("fewreviews", nFew, "Pocas reseñas", "Menos de 25 reseñas en Google")}
+      ${stat("phone", nPhone, "Con teléfono", "Se les puede llamar")}
+      ${stat("mine", nMine, "Encajan contigo", "Tienen alguna oportunidad de los servicios que ofreces (Ajustes)")}
+      <div class="stat stat-static"><span class="stat-n">${avg}</span><span class="stat-l">Score medio</span></div>
+    </div>
     <div class="toolbar">
       <div class="summary"><strong>${d.results.length}</strong> empresas en <strong>${esc(d.area.label)}</strong>${sectorsNote} · fuente ${esc(src)}${cost}</div>
       <div class="filters">
@@ -250,16 +381,26 @@ function renderResultsArea() {
         <label class="sr-only" for="f-opp">Oportunidad</label>
         <select id="f-opp">${OPP_FILTERS.map(([v, l]) => `<option value="${v}"${state.filters.opp === v ? " selected" : ""}>${l}</option>`).join("")}</select>
         <label class="sr-only" for="f-sort">Orden</label>
-        <select id="f-sort"><option value="score"${state.filters.sort === "score" ? " selected" : ""}>Mayor score</option><option value="name"${state.filters.sort === "name" ? " selected" : ""}>Nombre</option></select>
+        <select id="f-sort">${(
+          [
+            ["agency", "Sin web primero"],
+            ["score", "Mayor score"],
+            ["reviews", "Más reseñas"],
+            ["name", "Nombre"],
+          ] as Array<[SortKey, string]>
+        )
+          .map(([v, l]) => `<option value="${v}"${state.filters.sort === v ? " selected" : ""}>${l}</option>`)
+          .join("")}</select>
         <button class="btn btn-sm" id="batch-btn" type="button" title="Revisa la web de las 20 primeras con web registrada">Analizar top 20</button>
         <button class="btn btn-sm btn-ghost" id="csv-btn" type="button">Exportar CSV</button>
       </div>
     </div>
     ${warn}
     <div id="batch-progress"></div>
+    <div id="map-msg"></div>
     <div class="split">
       <div class="results" id="results"></div>
-      <div class="map-wrap"><div id="map"></div><div class="map-note">Mapa © OpenStreetMap · OpenFreeMap</div></div>
+      <div class="map-wrap"><div id="map"></div><div class="map-note" id="map-note">Cargando mapa…</div></div>
     </div>`;
 
   $("#f-min")!.addEventListener("input", (e) => {
@@ -272,9 +413,18 @@ function renderResultsArea() {
     renderCards();
   });
   $("#f-sort")!.addEventListener("change", (e) => {
-    state.filters.sort = (e.target as HTMLSelectElement).value as "score" | "name";
+    state.filters.sort = (e.target as HTMLSelectElement).value as SortKey;
+    state.shown = 60;
     renderCards();
   });
+  area.querySelectorAll<HTMLButtonElement>("[data-quick]").forEach((b) =>
+    b.addEventListener("click", () => {
+      state.quick = b.dataset.quick as QuickFilter;
+      state.shown = 60;
+      area.querySelectorAll(".stat").forEach((x) => x.classList.toggle("is-on", x === b));
+      renderCards();
+    }),
+  );
   $("#batch-btn")!.addEventListener("click", batchAnalyze);
   $("#csv-btn")!.addEventListener("click", exportCsv);
   renderCards();
@@ -291,6 +441,8 @@ function cardHtml(r: SearchResult): string {
   const c = r.company;
   const cur = currentResult(r);
   const reasons = cur.score.items.filter((i) => i.dimension !== "Encaje del sector").slice(0, 2);
+  const mine = myOppIds();
+  const fit = cur.opportunities.find((o) => mine.has(o.id));
   const status = cur.analyzed
     ? `<span class="badge verified">Analizada</span>`
     : c.website
@@ -302,6 +454,7 @@ function cardHtml(r: SearchResult): string {
       <div class="meta">${esc(c.sectorLabel)}${c.address ? ` · ${esc(c.address)}` : ""}${c.city ? ` · ${esc(c.city)}` : ""}${c.phone ? ` · <a href="tel:${esc(c.phone.replace(/\s/g, ""))}">${esc(c.phone)}</a>` : ""}</div>
       <div style="margin:6px 0">${presenceBadges(c)}</div>
       <div class="reco">Solución: <b>${esc(cur.recommended)}</b> ${status}</div>
+      ${!c.website ? `<div class="tag tag-hot">Sin web · oportunidad directa</div>` : fit ? `<div class="tag">Puedes ofrecer: ${esc(fit.title)}</div>` : ""}
       <ul class="reasons">${reasons.map((i) => `<li>${esc(i.reason)}</li>`).join("")}</ul>
     </div>
     ${scoreRing(cur.score.score)}
@@ -309,6 +462,7 @@ function cardHtml(r: SearchResult): string {
       ${c.website && !cur.analyzed ? `<button class="btn btn-sm btn-primary" data-analyze="${esc(c.id)}" type="button">Analizar oportunidad</button>` : ""}
       <a class="btn btn-sm" href="#/empresa/${encodeURIComponent(c.id)}">Ver perfil</a>
       ${c.website ? `<a class="btn btn-sm btn-ghost" href="${safeHref(c.website)}" target="_blank" rel="noopener noreferrer">${esc(hostOf(c.website))} ↗</a>` : ""}
+      ${c.googleMapsUri ? `<a class="btn btn-sm btn-ghost" href="${safeHref(c.googleMapsUri)}" target="_blank" rel="noopener noreferrer">Google Maps ↗</a>` : ""}
     </div>
   </article>`;
 }
@@ -317,7 +471,12 @@ function renderCards() {
   const el = $("#results");
   if (!el) return;
   const list = visibleResults();
-  el.innerHTML = list.length ? list.map(cardHtml).join("") : `<div class="empty">Ninguna empresa cumple los filtros. ${state.data?.results.length ? "Baja el score mínimo o cambia la oportunidad." : "Prueba con otra zona o con otra forma de nombrar el sector."}</div>`;
+  const more = list.length > state.shown ? `<button class="btn more-btn" id="more-btn" type="button">Ver ${Math.min(60, list.length - state.shown)} más (${list.length - state.shown} restantes)</button>` : "";
+  el.innerHTML = list.length ? list.slice(0, state.shown).map(cardHtml).join("") + more : `<div class="empty">Ninguna empresa cumple los filtros. ${state.data?.results.length ? "Baja el score mínimo o cambia la oportunidad." : "Prueba con otra zona o con otra forma de nombrar el sector."}</div>`;
+  $("#more-btn")?.addEventListener("click", () => {
+    state.shown += 60;
+    renderCards();
+  });
   el.querySelectorAll<HTMLButtonElement>("[data-analyze]").forEach((b) => b.addEventListener("click", () => analyzeOne(b.dataset.analyze!, b)));
   el.querySelectorAll<HTMLElement>(".card").forEach((card) =>
     card.addEventListener("mouseenter", () => {
@@ -399,49 +558,218 @@ function exportCsv() {
 }
 
 // ---------- Mapa ----------
+// Google Maps si hay clave (se ve como Google Maps de verdad); si no, o si Google falla, MapLibre + OpenFreeMap.
+
+declare const google: any;
+
+const MAPLIBRE_JS = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js";
+const MAPLIBRE_CSS = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css";
+let googleMapsPromise: Promise<boolean> | null = null;
+let maplibrePromise: Promise<boolean> | null = null;
+let googleMapsFailed = false;
+
+function loadScript(src: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const el = document.createElement("script");
+    el.src = src;
+    el.async = true;
+    el.onload = () => resolve(true);
+    el.onerror = () => resolve(false);
+    document.head.appendChild(el);
+  });
+}
+
+function loadGoogleMaps(key: string): Promise<boolean> {
+  if (googleMapsPromise) return googleMapsPromise;
+  googleMapsPromise = new Promise((resolve) => {
+    (window as any).__oosMapsReady = () => resolve(true);
+    // Google llama a esta función si la clave no vale o la API no está activada
+    (window as any).gm_authFailure = () => {
+      googleMapsFailed = true;
+      state.mapNote = "El mapa de Google no se ha podido cargar: activa «Maps JavaScript API» en Google Cloud para la misma clave. Mientras, se usa el mapa alternativo.";
+      if (state.data && $("#map")) initMap();
+    };
+    loadScript(`https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&language=es&region=ES&loading=async&callback=__oosMapsReady`).then((ok) => {
+      if (!ok) resolve(false);
+    });
+    setTimeout(() => resolve(false), 12000);
+  });
+  return googleMapsPromise;
+}
+
+function loadMaplibre(): Promise<boolean> {
+  if (maplibrePromise) return maplibrePromise;
+  const css = document.createElement("link");
+  css.rel = "stylesheet";
+  css.href = MAPLIBRE_CSS;
+  document.head.appendChild(css);
+  maplibrePromise = loadScript(MAPLIBRE_JS);
+  return maplibrePromise;
+}
+
+function cssVar(name: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#7c8594";
+}
+function scoreHex(v: number): string {
+  return cssVar(v >= 70 ? "--high" : v >= 45 ? "--mid" : "--low");
+}
+
+const GOOGLE_DARK = [
+  { elementType: "geometry", stylers: [{ color: "#1d2128" }] },
+  { elementType: "labels.text.fill", stylers: [{ color: "#9aa3ad" }] },
+  { elementType: "labels.text.stroke", stylers: [{ color: "#111418" }] },
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "road", elementType: "geometry", stylers: [{ color: "#2c333d" }] },
+  { featureType: "road", elementType: "labels.icon", stylers: [{ visibility: "off" }] },
+  { featureType: "transit", stylers: [{ visibility: "off" }] },
+  { featureType: "water", elementType: "geometry", stylers: [{ color: "#0e1a26" }] },
+];
+const GOOGLE_LIGHT = [
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "transit", stylers: [{ visibility: "off" }] },
+];
+
+interface MapAdapter {
+  kind: "google" | "maplibre";
+  setMarkers(list: SearchResult[]): void;
+  highlight(id: string | null): void;
+  applyTheme(): void;
+  destroy(): void;
+}
 
 function destroyMap() {
-  state.markers.forEach((m) => m.remove());
-  state.markers.clear();
-  state.map?.remove();
+  state.map?.destroy();
   state.map = null;
 }
 
 function applyMapTheme() {
-  const canvas = document.querySelector<HTMLElement>("#map .maplibregl-canvas");
-  if (canvas) canvas.style.filter = isDark() ? "invert(0.92) hue-rotate(180deg) saturate(0.6)" : "";
+  state.map?.applyTheme();
 }
 
-function initMap(retries = 20) {
+let mapToken = 0;
+async function initMap() {
   const el = $("#map");
   if (!el || !state.data) return;
-  if (typeof maplibregl === "undefined") {
-    if (retries > 0) setTimeout(() => initMap(retries - 1), 150);
-    else el.innerHTML = `<div class="map-fallback">No se pudo cargar el mapa. Los resultados siguen disponibles en la lista.</div>`;
-    return;
-  }
+  const token = ++mapToken;
   destroyMap();
-  const [s, w, n, e] = state.data.area.bbox;
-  state.map = new maplibregl.Map({ container: el, style: "https://tiles.openfreemap.org/styles/positron", bounds: [[w, s], [e, n]], fitBoundsOptions: { padding: 30 }, attributionControl: { compact: true } });
-  state.map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
-  state.map.on("load", applyMapTheme);
-  state.map.on("error", () => {});
-  updateMarkers(visibleResults());
+  await ensureConfig();
+  if (token !== mapToken) return;
+  const key = state.config?.mapsKey;
+  const note = $("#map-note");
+  if (key && !googleMapsFailed && (await loadGoogleMaps(key)) && typeof google !== "undefined" && google.maps?.Map) {
+    if (token !== mapToken || !document.body.contains(el)) return;
+    state.map = googleAdapter(el);
+    if (note) note.textContent = "Google Maps";
+  } else {
+    if (!(await loadMaplibre()) || typeof maplibregl === "undefined") {
+      el.innerHTML = `<div class="map-fallback">No se pudo cargar el mapa. Los resultados siguen disponibles en la lista.</div>`;
+      return;
+    }
+    if (token !== mapToken || !document.body.contains(el)) return;
+    state.map = maplibreAdapter(el);
+    if (note) note.textContent = "Mapa © OpenStreetMap · OpenFreeMap";
+  }
+  if (state.mapNote && $("#map-msg")) $("#map-msg")!.innerHTML = `<div class="notice" style="margin-bottom:10px">${esc(state.mapNote)}</div>`;
+  state.map.setMarkers(visibleResults());
+}
+
+function googleAdapter(el: HTMLElement): MapAdapter {
+  const [s, w, n, e] = state.data!.area.bbox;
+  const map = new google.maps.Map(el, {
+    mapTypeControl: false,
+    streetViewControl: false,
+    fullscreenControl: true,
+    clickableIcons: false,
+    gestureHandling: "greedy",
+    styles: isDark() ? GOOGLE_DARK : GOOGLE_LIGHT,
+  });
+  map.fitBounds({ south: s, west: w, north: n, east: e }, 30);
+  const info = new google.maps.InfoWindow();
+  let markers = new Map<string, any>();
+  const icon = (r: SearchResult, active: boolean) => ({
+    path: google.maps.SymbolPath.CIRCLE,
+    scale: active ? 10 : 7,
+    fillColor: scoreHex(currentResult(r).score.score),
+    fillOpacity: 1,
+    strokeColor: "#ffffff",
+    strokeWeight: 2,
+  });
+  const byId = new Map<string, SearchResult>();
+  return {
+    kind: "google",
+    setMarkers(list) {
+      markers.forEach((m) => m.setMap(null));
+      markers = new Map();
+      byId.clear();
+      for (const r of list) {
+        byId.set(r.company.id, r);
+        const m = new google.maps.Marker({ position: { lat: r.company.lat, lng: r.company.lon }, map, title: `${r.company.name} · ${currentResult(r).score.score}`, icon: icon(r, state.activeId === r.company.id), zIndex: state.activeId === r.company.id ? 999 : 1 });
+        m.addListener("click", () => {
+          setActive(r.company.id, true);
+          const c = r.company;
+          info.setContent(`<div class="iw"><strong>${esc(c.name)}</strong><div>${esc(c.sectorLabel)} · score ${currentResult(r).score.score}</div>${c.rating !== undefined ? `<div>${c.rating.toFixed(1)} ★ · ${c.reviews ?? 0} reseñas</div>` : ""}<div>${c.website ? "Tiene web" : "<b>Sin web</b>"}${c.phone ? ` · ${esc(c.phone)}` : ""}</div><a href="#/empresa/${encodeURIComponent(c.id)}">Ver perfil →</a></div>`);
+          info.open({ anchor: m, map });
+        });
+        markers.set(r.company.id, m);
+      }
+    },
+    highlight(id) {
+      markers.forEach((m, mid) => {
+        const r = byId.get(mid);
+        if (!r) return;
+        m.setIcon(icon(r, mid === id));
+        m.setZIndex(mid === id ? 999 : 1);
+      });
+    },
+    applyTheme() {
+      map.setOptions({ styles: isDark() ? GOOGLE_DARK : GOOGLE_LIGHT });
+    },
+    destroy() {
+      markers.forEach((m) => m.setMap(null));
+      markers.clear();
+      info.close();
+    },
+  };
+}
+
+function maplibreAdapter(el: HTMLElement): MapAdapter {
+  const [s, w, n, e] = state.data!.area.bbox;
+  const map = new maplibregl.Map({ container: el, style: "https://tiles.openfreemap.org/styles/positron", bounds: [[w, s], [e, n]], fitBoundsOptions: { padding: 30 }, attributionControl: { compact: true } });
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+  const theme = () => {
+    const canvas = el.querySelector<HTMLElement>(".maplibregl-canvas");
+    if (canvas) canvas.style.filter = isDark() ? "invert(0.92) hue-rotate(180deg) saturate(0.6)" : "";
+  };
+  map.on("load", theme);
+  map.on("error", () => {});
+  let markers = new Map<string, any>();
+  return {
+    kind: "maplibre",
+    setMarkers(list) {
+      markers.forEach((m) => m.remove());
+      markers = new Map();
+      for (const r of list) {
+        const div = document.createElement("div");
+        div.className = `marker${state.activeId === r.company.id ? " is-active" : ""}`;
+        div.style.background = scoreColor(currentResult(r).score.score);
+        div.title = `${r.company.name} · ${currentResult(r).score.score}`;
+        div.addEventListener("click", () => setActive(r.company.id, true));
+        markers.set(r.company.id, new maplibregl.Marker({ element: div }).setLngLat([r.company.lon, r.company.lat]).addTo(map));
+      }
+    },
+    highlight(id) {
+      markers.forEach((m, mid) => m.getElement().classList.toggle("is-active", mid === id));
+    },
+    applyTheme: theme,
+    destroy() {
+      markers.forEach((m) => m.remove());
+      map.remove();
+    },
+  };
 }
 
 function updateMarkers(list: SearchResult[]) {
-  if (!state.map) return;
-  state.markers.forEach((m) => m.remove());
-  state.markers.clear();
-  for (const r of list) {
-    const div = document.createElement("div");
-    div.className = `marker${state.activeId === r.company.id ? " is-active" : ""}`;
-    div.style.background = scoreColor(currentResult(r).score.score);
-    div.title = `${r.company.name} · ${currentResult(r).score.score}`;
-    div.addEventListener("click", () => setActive(r.company.id, true));
-    const m = new maplibregl.Marker({ element: div }).setLngLat([r.company.lon, r.company.lat]).addTo(state.map);
-    state.markers.set(r.company.id, m);
-  }
+  state.map?.setMarkers(list);
 }
 
 function setActive(id: string, scrollCard: boolean) {
@@ -451,7 +779,7 @@ function setActive(id: string, scrollCard: boolean) {
   const card = document.querySelector<HTMLElement>(`.card[data-id="${CSS.escape(id)}"]`);
   card?.classList.add("is-active");
   if (scrollCard) card?.scrollIntoView({ behavior: "smooth", block: "center" });
-  state.markers.forEach((m, mid) => m.getElement().classList.toggle("is-active", mid === id));
+  state.map?.highlight(id);
 }
 
 // ---------- Perfil de empresa ----------
@@ -652,30 +980,193 @@ function bindProfile(c: Company) {
   });
 }
 
-// ---------- Integraciones ----------
+// ---------- Ajustes ----------
+
+let configPromise: Promise<AppConfig | null> | null = null;
+function ensureConfig(): Promise<AppConfig | null> {
+  if (state.config) return Promise.resolve(state.config);
+  configPromise ??= api<AppConfig>("/api/config")
+    .then((c) => (state.config = c))
+    .catch(() => null)
+    .finally(() => (configPromise = null));
+  return configPromise;
+}
 
 async function renderSettings() {
   destroyMap();
   const app = $("#app")!;
-  app.innerHTML = `<section class="view"><div class="eyebrow">Integraciones</div><h1 class="hero">Estado de las conexiones</h1><div id="cfg"><div class="skeleton"></div></div></section>`;
+  const st = loadSettings();
+  app.innerHTML = `<section class="view narrow">
+    <div class="eyebrow">Ajustes</div><h1 class="hero">Configura tu OpportunityOS</h1>
+    <form class="panel" id="settings-form">
+      <h2>Tu agencia</h2>
+      <label class="field"><span>Nombre de tu agencia</span><input name="agencyName" value="${esc(st.agencyName)}" maxlength="60"></label>
+      <p class="muted" style="margin:14px 0 8px">Servicios que ofreces: los negocios que los necesitan se marcan con «Puedes ofrecer» y aparecen en el filtro «Encajan contigo».</p>
+      <div class="checks">${SERVICES.map(([id, label]) => `<label class="check"><input type="checkbox" name="svc" value="${id}"${st.services.includes(id) ? " checked" : ""}><span>${esc(label)}</span></label>`).join("")}</div>
+      <h2 style="margin-top:22px">Búsqueda</h2>
+      <div class="field-row">
+        <label class="field"><span>Orden por defecto</span><select name="sort">${(
+          [
+            ["agency", "Sin web primero"],
+            ["score", "Mayor score"],
+            ["reviews", "Más reseñas"],
+            ["name", "Nombre"],
+          ] as Array<[SortKey, string]>
+        )
+          .map(([v, l]) => `<option value="${v}"${st.sort === v ? " selected" : ""}>${l}</option>`)
+          .join("")}</select></label>
+        <label class="field"><span>Resultados por búsqueda</span><select name="limit">${[100, 200, 300, 500].map((n) => `<option value="${n}"${st.limit === n ? " selected" : ""}>${n}</option>`).join("")}</select></label>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:16px"><button class="btn btn-primary" type="submit">Guardar ajustes</button><span class="muted" id="settings-saved" aria-live="polite"></span></div>
+      <p class="muted" style="font-size:12.5px;margin:10px 0 0">Se guardan en este navegador.</p>
+    </form>
+    <div class="panel"><h2>Conexiones</h2><div id="cfg"><div class="skeleton"></div></div></div>
+  </section>`;
+  $("#settings-form")!.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target as HTMLFormElement);
+    const next: Settings = {
+      agencyName: String(f.get("agencyName") ?? "").trim() || DEFAULT_SETTINGS.agencyName,
+      services: f.getAll("svc").map(String),
+      sort: String(f.get("sort")) as SortKey,
+      limit: Number(f.get("limit")) || 300,
+    };
+    saveSettings(next);
+    state.filters.sort = next.sort;
+    $("#settings-saved")!.textContent = "Guardado ✓";
+    setTimeout(() => ($("#settings-saved")!.textContent = ""), 2000);
+  });
   try {
-    state.config = await api("/api/config");
-    const i = state.config!.integrations;
+    state.config = null;
+    const cfg = (await ensureConfig())!;
+    if (!cfg) throw new Error("No se pudo leer la configuración");
+    const i = cfg.integrations;
     const row = (ok: boolean, name: string, desc: string, variable: string) =>
-      `<li><div><span class="dot${ok ? " ok" : ""}"></span><strong>${name}</strong><div class="muted" style="font-size:13px;margin-left:16px">${desc}</div></div><div class="muted" style="font-size:12.5px;text-align:right">${ok ? "Configurado" : `Falta <code class="mono">${variable}</code>`}</div></li>`;
+      `<li><div><span class="dot${ok ? " ok" : ""}"></span><strong>${name}</strong><div class="muted" style="font-size:13px;margin-left:16px">${desc}</div></div><div class="muted" style="font-size:12.5px;text-align:right">${ok ? "Conectado" : `Falta <code class="mono">${variable}</code>`}</div></li>`;
     $("#cfg")!.innerHTML = `<ul class="status-list">
-      ${row(i.googlePlaces, "Google Maps (Places API)", `Fuente principal: encuentra prácticamente todos los negocios de la zona, con teléfono, web, valoración y reseñas. Hasta ${i.googleMaxCalls ?? 12} consultas por búsqueda (≈ 0,035 US$ cada una; 1.000 gratis al mes).`, "GOOGLE_PLACES_API_KEY")}
+      ${row(i.googlePlaces, "Google Maps · búsqueda", `Fuente principal: prácticamente todos los negocios de la zona, con teléfono, web, valoración y reseñas. Hasta ${i.googleMaxCalls ?? 12} consultas por búsqueda (1.000 gratis al mes).`, "GOOGLE_PLACES_API_KEY")}
+      ${row(!!i.googleMaps && !googleMapsFailed, "Google Maps · mapa", googleMapsFailed ? "La clave no tiene activada «Maps JavaScript API». Actívala en Google Cloud (misma clave) y recarga." : "Mapa de Google en los resultados (10.000 cargas gratis al mes). Si falla, se usa un mapa alternativo.", "GOOGLE_PLACES_API_KEY")}
       ${row(true, "OpenStreetMap", "Zonas y negocios gratis. Completa los datos de Google (email, redes). Siempre activo.", "")}
+      ${row(i.ai, `IA${i.aiProvider ? ` · ${esc(i.aiProvider)}` : ""}`, i.aiFree ? "Asistente y textos comerciales (propuestas, emails, WhatsApp, guiones). IA gratuita de Cloudflare con límite diario; con ANTHROPIC_API_KEY usa Claude." : "Propuestas, emails, WhatsApp, LinkedIn y guiones de llamada.", "ANTHROPIC_API_KEY")}
       ${row(!!i.contactEmail, "Email de contacto (opcional)", "Recomendado por la política de uso de OpenStreetMap. Sin él, la búsqueda funciona igual.", "CONTACT_EMAIL")}
-      ${row(i.ai, `IA${i.aiProvider ? ` · ${esc(i.aiProvider)}` : ""}`, "Propuestas, emails, WhatsApp, LinkedIn y guiones de llamada.", "ANTHROPIC_API_KEY")}
-    </ul><p class="muted" style="margin-top:14px;font-size:13px">Reglas del Opportunity Engine: versión <span class="mono">${esc(state.config!.rulesVersion)}</span>.</p>`;
+    </ul><p class="muted" style="margin-top:14px;font-size:13px">Las claves se añaden en Cloudflare → Workers → opportunity-os → Settings → Variables and Secrets (tipo Secret). Reglas del Opportunity Engine: versión <span class="mono">${esc(cfg.rulesVersion)}</span>.</p>`;
   } catch (e) {
     $("#cfg")!.innerHTML = errorBox(e as ApiError);
   }
 }
 
+// ---------- Ayuda y contacto ----------
+
+async function renderHelp() {
+  destroyMap();
+  const app = $("#app")!;
+  const cfg = await ensureConfig();
+  const c = cfg?.contact ?? { company: "ZYRA", web: "https://digitalzyra.com", contactPage: "https://digitalzyra.com/es-es/contacto/", email: "zyradigitalpersonal@gmail.com", phone: "+34 643 41 24 54", whatsapp: "https://wa.me/34643412454", instagram: "https://www.instagram.com/zyra_personal", linkedin: "https://www.linkedin.com/in/digital-zyra-730293439", tiktok: "https://www.tiktok.com/@digitalzyra" };
+  const faq: Array<[string, string]> = [
+    ["¿Cómo busco?", "Escribe el tipo de negocio y la zona como te salga: «dentistas Lleida», «restaurantes de Tenerife», «peluquerías en La Laguna sin web». Puedes añadir «sin web» o «sin reservas» para filtrar."],
+    ["¿Qué es el Opportunity Score?", "Un número de 0 a 100: cuanto más alto, más le falta digitalizar a ese negocio. Cada punto tiene su motivo y se marca como verificado (dato real) o inferido (típico del sector)."],
+    ["¿Por qué salen primero los que no tienen web?", "Es la venta más directa para una agencia. Puedes cambiar el orden en la barra de resultados o en Ajustes."],
+    ["¿Cuánto cuesta cada búsqueda?", "OpenStreetMap y la IA gratuita no cuestan nada. Google: 1.000 consultas gratis al mes (cada una trae hasta 20 negocios); la app te enseña el coste de cada búsqueda."],
+    ["¿Puedo enviar los emails que genera?", "La app redacta, no envía. Por ley (LSSI art. 21) no se deben enviar emails o WhatsApp comerciales sin permiso: úsalos después de un primer contacto por teléfono o en persona."],
+  ];
+  app.innerHTML = `<section class="view narrow">
+    <div class="eyebrow">Ayuda y contacto</div><h1 class="hero">¿En qué te ayudamos?</h1>
+    <div class="help-hero panel">
+      <div><h2>Asistente de OpportunityOS</h2><p class="muted" style="margin:0">Pregúntale cómo usar el programa, qué significa cada dato o cómo preparar una llamada.</p></div>
+      <button class="btn btn-primary" type="button" data-open-assistant>Abrir asistente</button>
+    </div>
+    <div class="panel"><h2>Contacta con ${esc(c.company)}</h2>
+      <div class="contact-grid">
+        <a class="contact" href="mailto:${esc(c.email)}"><span class="contact-l">Email</span><strong>${esc(c.email)}</strong></a>
+        <a class="contact" href="${safeHref(c.whatsapp)}" target="_blank" rel="noopener noreferrer"><span class="contact-l">WhatsApp</span><strong>${esc(c.phone)}</strong></a>
+        <a class="contact" href="tel:${esc(c.phone.replace(/\s/g, ""))}"><span class="contact-l">Teléfono</span><strong>${esc(c.phone)}</strong></a>
+        <a class="contact" href="${safeHref(c.contactPage)}" target="_blank" rel="noopener noreferrer"><span class="contact-l">Web</span><strong>${esc(hostOf(c.web))}</strong></a>
+      </div>
+      <p class="socials"><a href="${safeHref(c.instagram)}" target="_blank" rel="noopener noreferrer">Instagram</a> · <a href="${safeHref(c.linkedin)}" target="_blank" rel="noopener noreferrer">LinkedIn</a> · <a href="${safeHref(c.tiktok)}" target="_blank" rel="noopener noreferrer">TikTok</a></p>
+    </div>
+    <div class="panel"><h2>Preguntas frecuentes</h2>${faq.map(([q, a]) => `<details class="faq"><summary>${esc(q)}</summary><p>${esc(a)}</p></details>`).join("")}</div>
+  </section>`;
+  bindAssistantOpeners(app);
+}
+
+// ---------- Asistente ----------
+
+const ASSISTANT_SUGGESTIONS = ["¿Cómo encuentro negocios sin web?", "¿Qué significa el score?", "¿Cuánto me cuesta Google?", "¿Cómo preparo una llamada de venta?"];
+
+function renderAssistantLog() {
+  const log = $("#assistant-log");
+  if (!log) return;
+  const fmt = (t: string) => esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>");
+  log.innerHTML =
+    (state.chat.length ? "" : `<div class="msg msg-a">¡Hola! Soy el asistente de OpportunityOS. Pregúntame cómo buscar negocios, qué significa cada dato o cómo preparar una propuesta.</div>`) +
+    state.chat.map((m) => `<div class="msg ${m.role === "user" ? "msg-u" : "msg-a"}">${fmt(m.content)}</div>`).join("") +
+    (state.chatBusy ? `<div class="msg msg-a msg-typing"><span></span><span></span><span></span></div>` : "");
+  log.scrollTop = log.scrollHeight;
+  const sug = $("#assistant-suggest");
+  if (sug) sug.innerHTML = state.chat.length ? "" : ASSISTANT_SUGGESTIONS.map((q) => `<button type="button" class="chip chip-soft" data-ask="${esc(q)}">${esc(q)}</button>`).join("");
+  sug?.querySelectorAll<HTMLButtonElement>("[data-ask]").forEach((b) => b.addEventListener("click", () => askAssistant(b.dataset.ask!)));
+}
+
+async function askAssistant(text: string) {
+  const q = text.trim();
+  if (!q || state.chatBusy) return;
+  state.chat.push({ role: "user", content: q });
+  state.chatBusy = true;
+  renderAssistantLog();
+  try {
+    const res = await api<{ text: string; meta: { model: string } }>("/api/assistant", { messages: state.chat.slice(-10) });
+    state.chat.push({ role: "assistant", content: res.text });
+  } catch (e) {
+    state.chat.push({ role: "assistant", content: `No he podido responder: ${(e as Error).message}` });
+  } finally {
+    state.chatBusy = false;
+    renderAssistantLog();
+  }
+}
+
+function openAssistant() {
+  const panel = $("#assistant");
+  if (!panel) return;
+  panel.hidden = false;
+  document.body.classList.add("assistant-open");
+  renderAssistantLog();
+  ($("#assistant-input") as HTMLInputElement | null)?.focus();
+}
+
+function bindAssistantOpeners(root: ParentNode = document) {
+  root.querySelectorAll<HTMLElement>("[data-open-assistant]").forEach((b) => {
+    if (b.dataset.bound) return;
+    b.dataset.bound = "1";
+    b.addEventListener("click", openAssistant);
+  });
+}
+
+function initAssistant() {
+  bindAssistantOpeners();
+  $("#assistant-close")?.addEventListener("click", () => {
+    $("#assistant")!.hidden = true;
+    document.body.classList.remove("assistant-open");
+  });
+  $("#assistant-form")?.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const input = $("#assistant-input") as HTMLInputElement;
+    const v = input.value;
+    input.value = "";
+    askAssistant(v);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("#assistant")!.hidden) {
+      $("#assistant")!.hidden = true;
+      document.body.classList.remove("assistant-open");
+    }
+  });
+}
+
 // ---------- Arranque ----------
 
 initTheme();
+initAssistant();
 window.addEventListener("hashchange", route);
+// La configuración (clave del mapa, contacto) se pide en paralelo: la interfaz no espera por ella
+ensureConfig();
 route();

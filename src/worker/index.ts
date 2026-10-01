@@ -8,7 +8,7 @@ import { OsmProvider, type DataProvider } from "../core/osm.js";
 import { analyzeCompany, RULES_VERSION } from "../core/opportunity-engine.js";
 import { auditWebsite } from "../core/web-audit.js";
 import { fetchGooglePlace, GOOGLE_TEXT_SEARCH_USD } from "../core/google-places.js";
-import { buildGenerationPrompt, createProvider, estimateCostUsd, type GenerationKind } from "../core/ai.js";
+import { ASSISTANT_SYSTEM, buildGenerationPrompt, createProvider, estimateCostUsd, flattenChat, freeProvider, ZYRA_CONTACT, type ChatMessage, type GenerationKind, type WorkersAIBinding } from "../core/ai.js";
 import { ExternalError } from "../core/http.js";
 import { resolveSector } from "../core/sectors.js";
 import type { Analysis, Company, GeoArea, WebAudit } from "../core/types.js";
@@ -27,6 +27,11 @@ export interface Env {
   AI_MODEL?: string;
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
+  /** Workers AI (binding «AI» en wrangler.jsonc): IA gratuita */
+  AI?: WorkersAIBinding;
+  WORKERS_AI_MODEL?: string;
+  /** Clave de navegador para el mapa de Google (restringida por dominio). Si falta, se usa GOOGLE_PLACES_API_KEY. */
+  GOOGLE_MAPS_BROWSER_KEY?: string;
   /** Solo para tests: permite inyectar proveedores */
   __deps?: Partial<Deps>;
 }
@@ -305,18 +310,48 @@ function handleConfig(env: Env) {
       contactEmail: !!env.CONTACT_EMAIL,
       googlePlaces: !!env.GOOGLE_PLACES_API_KEY,
       googleMaxCalls: Math.min(Math.max(Number(env.GOOGLE_MAX_CALLS) || 12, 1), 60),
+      googleMaps: !!(env.GOOGLE_MAPS_BROWSER_KEY ?? env.GOOGLE_PLACES_API_KEY),
       ai: !("missing" in ai),
+      aiFree: !!env.AI,
       aiProvider: "missing" in ai ? null : `${ai.name} · ${ai.model}`,
     },
+    // Solo para usuarios con sesión: carga el mapa de Google en el navegador
+    mapsKey: env.GOOGLE_MAPS_BROWSER_KEY ?? env.GOOGLE_PLACES_API_KEY ?? null,
+    contact: ZYRA_CONTACT,
     missing: [!env.GOOGLE_PLACES_API_KEY && "GOOGLE_PLACES_API_KEY", "missing" in ai && ai.missing, !env.CONTACT_EMAIL && "CONTACT_EMAIL"].filter(Boolean),
     rulesVersion: RULES_VERSION,
   });
 }
 
+async function handleAssistant(req: Request, env: Env) {
+  const body = await readJson(req, 32_000);
+  const raw = Array.isArray(body.messages) ? body.messages.slice(-10) : [];
+  const messages: ChatMessage[] = raw
+    .filter((m: any) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
+    .map((m: any) => ({ role: m.role, content: m.content.trim().slice(0, 1500) }));
+  if (!messages.length || messages[messages.length - 1].role !== "user") return fail(400, "Escribe tu pregunta.");
+  // El asistente usa la IA gratuita si existe; si no, la de pago configurada
+  const free = freeProvider(env);
+  let text: string;
+  let model: string;
+  if (free) {
+    const r = await free.chat(ASSISTANT_SYSTEM, messages, 500);
+    text = r.text;
+    model = r.model;
+  } else {
+    const provider = createProvider(env, deps(env, req).fetchImpl);
+    if ("missing" in provider) return fail(503, "El asistente no está disponible: falta configurar la IA.", { missing: provider.missing });
+    const r = await provider.generate({ system: ASSISTANT_SYSTEM, prompt: flattenChat(messages), maxTokens: 500 });
+    text = r.text;
+    model = r.model;
+  }
+  return json({ text: text || "Ahora mismo no tengo respuesta. Prueba a reformular la pregunta o escribe a ZYRA.", meta: { model } });
+}
+
 // ---------- Login ----------
 
 function loginPage(error?: string): Response {
-  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpportunityOS · Acceso</title><link rel="stylesheet" href="/styles.css"></head>
+  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpportunityOS · Acceso</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&display=swap"><link rel="stylesheet" href="/styles.css"></head>
 <body class="login-body"><form class="login-card" method="post" action="/login"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>OpportunityOS</span></div>
 <h1>Encuentra oportunidades.</h1><p class="muted">Herramienta privada. Introduce la contraseña de acceso.</p>
 <label for="pw">Contraseña</label><input id="pw" name="password" type="password" autocomplete="current-password" required autofocus>
@@ -339,7 +374,9 @@ export async function handle(req: Request, env: Env, ctx: Ctx): Promise<Response
     return new Response("Configura la variable APP_PASSWORD (y SESSION_SECRET) antes de usar OpportunityOS.", { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
   }
 
-  if (url.pathname === "/styles.css" && env.ASSETS) return env.ASSETS.fetch(req);
+  if ((url.pathname === "/styles.css" || url.pathname === "/favicon.svg" || url.pathname === "/favicon.ico") && env.ASSETS) {
+    return env.ASSETS.fetch(url.pathname === "/favicon.ico" ? new Request(new URL("/favicon.svg", url), req) : req);
+  }
 
   if (url.pathname === "/login") {
     if (req.method === "GET") return loginPage();
@@ -370,6 +407,9 @@ export async function handle(req: Request, env: Env, ctx: Ctx): Promise<Response
           return await handleAnalyze(req, env, ctx);
         case "/api/google":
           return await handleGoogle(req, env);
+        case "/api/assistant":
+          if (!aiLimiter.allow(`ai:${ip}`)) return fail(429, "Demasiadas preguntas seguidas. Espera un minuto.");
+          return await handleAssistant(req, env);
         case "/api/generate":
           if (!aiLimiter.allow(`ai:${ip}`)) return fail(429, "Límite de generaciones por minuto alcanzado.");
           return await handleGenerate(req, env, ctx);

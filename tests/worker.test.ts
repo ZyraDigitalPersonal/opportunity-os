@@ -168,3 +168,27 @@ test("búsqueda sin CONTACT_EMAIL ya no se bloquea", async () => {
   const res = await worker.fetch(new Request("https://app.test/api/search", { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify({ q: "Peluquerías en Lleida" }) }), { ...env, CONTACT_EMAIL: undefined }, ctx);
   assert.equal(res.status, 200);
 });
+
+test("favicon se sirve sin sesión", async () => {
+  const assets = { fetch: async (r: Request) => new Response(new URL(r.url).pathname, { status: 200 }) };
+  const res = await worker.fetch(new Request("https://app.test/favicon.ico"), { ...env, ASSETS: assets }, ctx);
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), "/favicon.svg");
+});
+
+test("asistente e IA gratis con Workers AI cuando no hay clave de pago", async () => {
+  const cookie = await login();
+  const calls: any[] = [];
+  const AI = { run: async (model: string, input: any) => (calls.push({ model, input }), { response: "Respuesta de prueba", usage: { prompt_tokens: 10, completion_tokens: 5 } }) };
+  const envAI: Env = { ...env, AI };
+  const res = await worker.fetch(new Request("https://app.test/api/assistant", { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify({ messages: [{ role: "user", content: "¿Qué es el score?" }] }) }), envAI, ctx);
+  assert.equal(res.status, 200);
+  assert.equal(((await res.json()) as any).text, "Respuesta de prueba");
+  assert.equal(calls[0].input.messages[0].role, "system");
+  const gen = await worker.fetch(new Request("https://app.test/api/generate", { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify({ kind: "email", company: companies[0] }) }), envAI, ctx);
+  assert.equal(gen.status, 200);
+  const cfg = await worker.fetch(new Request("https://app.test/api/config", { headers: { cookie } }), envAI, ctx);
+  const c = (await cfg.json()) as any;
+  assert.equal(c.integrations.ai, true);
+  assert.equal(c.contact.email, "zyradigitalpersonal@gmail.com");
+});
