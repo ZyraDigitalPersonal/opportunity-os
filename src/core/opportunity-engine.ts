@@ -4,7 +4,7 @@
 import type { Analysis, Company, Opportunity, OpportunityScore, Priority, ScoreItem, Signal, WebAudit } from "./types.js";
 import { resolveSector, type SectorProfile } from "./sectors.js";
 
-export const RULES_VERSION = "2026-10-01.1";
+export const RULES_VERSION = "2026-10-01.2";
 const SLOW_MS = 3000;
 
 const DIMENSION_CAPS: Record<ScoreItem["dimension"], number> = {
@@ -35,6 +35,8 @@ export function extractSignals(c: Company, audit: WebAudit | undefined, sector: 
   }
   if (c.source === "Google" && (c.reviews ?? 0) < 25) s.push({ key: "few_reviews", label: `Pocas reseñas en Google (${c.reviews ?? 0})`, confidence: "verificado", source: "Google Maps" });
   if (c.source === "Google" && (c.reviews ?? 0) >= 150) s.push({ key: "busy_business", label: `Negocio con mucho movimiento (${c.reviews} reseñas)`, confidence: "verificado", source: "Google Maps" });
+  const COMPLAINT_LABEL = { telefono: "Clientes se quejan de que no cogen el teléfono", esperas: "Clientes se quejan de esperas o problemas con citas/reservas", atencion: "Clientes se quejan de la atención o de que no responden mensajes" } as const;
+  for (const k of c.complaints ?? []) s.push({ key: `complaint_${k.type}`, label: COMPLAINT_LABEL[k.type], confidence: "verificado", source: "Reseñas de Google", evidence: `«${k.quote}»` });
   if (c.reservation && /^(yes|required|recommended)$/.test(c.reservation)) s.push({ key: "takes_reservations", label: "Acepta o requiere reserva", confidence: "verificado", source: osm, evidence: `reservation=${c.reservation}` });
 
   if (audit) {
@@ -109,6 +111,9 @@ export function computeScore(signals: Signal[], sector: SectorProfile, audited: 
   if (has("has_email") || has("web_email")) add("Potencial comercial", 2, has("has_email") ? "has_email" : "web_email");
   if (has("busy_business")) add("Potencial comercial", 3, "busy_business", "Mucho volumen de clientes: más llamadas y reservas que automatizar");
   if (has("low_rating")) add("Atención al cliente", 4, "low_rating");
+  if (has("complaint_telefono")) add("Atención al cliente", 8, "complaint_telefono");
+  if (has("complaint_esperas")) add("Reservas y automatización", 8, "complaint_esperas");
+  if (has("complaint_atencion")) add("Atención al cliente", 6, "complaint_atencion");
   if (has("few_reviews")) add("Presencia digital", 3, "few_reviews");
 
   // Encaje del sector
@@ -136,7 +141,51 @@ export function detectOpportunities(signals: Signal[], sector: SectorProfile, c:
   const noBooking = !has("booking_detected");
   const ops: Opportunity[] = [];
 
-  if (sector.phoneHeavy && c.phone && noBooking) {
+  // ---- Le falta un sistema (el motivo concreto de la llamada) ----
+  if (has("complaint_telefono") || has("complaint_atencion")) {
+    ops.push({
+      id: "comm_system",
+      title: "Sistema de comunicación",
+      priority: "alta",
+      system: true,
+      problem: has("complaint_telefono") ? "Sus clientes dicen en Google que no cogen el teléfono: pierden reservas y ventas cada día." : "Sus clientes se quejan en Google de la atención o de que no responden los mensajes.",
+      solution: "Agente de voz IA que coge todas las llamadas 24/7 + WhatsApp automatizado que responde al momento y pasa a una persona cuando hace falta.",
+      basedOn: [has("complaint_telefono") ? "complaint_telefono" : "complaint_atencion"],
+    });
+  }
+  if (has("complaint_esperas")) {
+    ops.push({
+      id: "booking_system",
+      title: "Sistema de citas y reservas",
+      priority: "alta",
+      system: true,
+      problem: "Sus clientes se quejan en Google de esperas o de problemas con las citas o reservas.",
+      solution: "Reservas online con calendario, confirmación y recordatorios automáticos, y lista de espera que rellena huecos.",
+      basedOn: ["complaint_esperas"],
+    });
+  } else if (sector.appointmentBased && has("no_booking_detected") && (has("busy_business") || sector.phoneHeavy)) {
+    ops.push({
+      id: "booking_system",
+      title: "Sistema de citas y reservas",
+      priority: "alta",
+      system: true,
+      problem: "Trabaja con citas y su web no tiene reserva online: todo pasa por el teléfono.",
+      solution: "Reservas online con calendario, confirmación y recordatorios automáticos.",
+      basedOn: ["no_booking_detected", "appointment_based"],
+    });
+  } else if (sector.appointmentBased && sector.phoneHeavy && has("busy_business") && noBooking && (noWeb || webDown)) {
+    ops.push({
+      id: "comm_system",
+      title: "Sistema de comunicación",
+      priority: "alta",
+      system: true,
+      problem: "Mucho volumen de clientes, sin web y sin reserva online: todo entra por teléfono y se pierden llamadas.",
+      solution: "Agente de voz IA que coge las llamadas y agenda citas + web con reservas online.",
+      basedOn: ["busy_business", "no_website_found"],
+    });
+  }
+
+  if (sector.phoneHeavy && c.phone && noBooking && !ops.some((o) => o.id === "comm_system")) {
     ops.push({
       id: "voice_agent",
       title: "Agente de voz IA",
@@ -210,6 +259,11 @@ export function detectOpportunities(signals: Signal[], sector: SectorProfile, c:
     ops.push({ id: "crm", title: "CRM y fidelización", priority: "baja", problem: "Con clientes recurrentes, sin CRM se pierden seguimientos y ventas repetidas.", solution: "CRM sencillo con historial de cliente, campañas y avisos de seguimiento.", basedOn: ["recurring_clients"] });
   }
   return ops.sort((a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]);
+}
+
+/** Primer sistema que le falta (para la cajita «Falta un sistema»), o null. */
+export function systemGap(ops: Opportunity[]): string | null {
+  return ops.find((o) => o.system)?.title ?? null;
 }
 
 export function recommend(ops: Opportunity[]): string {

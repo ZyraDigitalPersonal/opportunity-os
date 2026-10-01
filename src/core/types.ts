@@ -38,6 +38,13 @@ export interface Company {
   googleMapsUri?: string;
   /** El negocio aparece también en otra fuente (OSM + Google) */
   alsoIn?: string;
+  /** Quejas detectadas en las reseñas de Google (se calculan en vivo, no se guardan) */
+  complaints?: Complaint[];
+}
+
+export interface Complaint {
+  type: "telefono" | "esperas" | "atencion";
+  quote: string;
 }
 
 export interface Signal {
@@ -73,6 +80,8 @@ export interface Opportunity {
   problem: string;
   solution: string;
   basedOn: string[]; // signal keys
+  /** Le falta un sistema (comunicación, reservas, atención): el motivo de la llamada */
+  system?: boolean;
 }
 
 export interface WebAudit {

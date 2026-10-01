@@ -2,13 +2,14 @@
 
 import type { Analysis, Company, GeoArea, Opportunity, OpportunityScore, Signal } from "../core/types.js";
 
-declare const maplibregl: any;
 
 interface SearchResult {
   company: Company;
   score: OpportunityScore;
   recommended: string;
   opportunities: Opportunity[];
+  /** Sistema que le falta (comunicación, reservas…) */
+  system?: string | null;
 }
 interface SearchResponse {
   parsed: { raw: string; sectorIds: string[]; sectorsFromIntent: boolean; keyword?: string; location?: string; postcode?: string; intents: string[] };
@@ -22,12 +23,21 @@ interface ApiError extends Error {
   missing?: string;
 }
 
+interface Toggles {
+  googleSearch: boolean;
+  googleMap: boolean;
+  osm: boolean;
+  ai: boolean;
+}
+type MapStyle = "dark" | "light" | "auto" | "google";
 type SortKey = "agency" | "score" | "reviews" | "name";
-type QuickFilter = "all" | "noweb" | "nobooking" | "fewreviews" | "phone" | "mine";
+type QuickFilter = "all" | "noweb" | "system" | "nobooking" | "fewreviews" | "phone" | "mine";
 
 interface AppConfig {
   integrations: { openStreetMap: boolean; contactEmail?: boolean; googlePlaces: boolean; googleMaxCalls?: number; googleMaps?: boolean; ai: boolean; aiFree?: boolean; aiProvider: string | null };
   mapsKey?: string | null;
+  toggles?: Toggles;
+  canToggle?: boolean;
   contact?: { company: string; web: string; contactPage: string; email: string; phone: string; whatsapp: string; instagram: string; linkedin: string; tiktok: string };
   missing: string[];
   rulesVersion: string;
@@ -48,16 +58,22 @@ const SERVICES: Array<[string, string, string[]]> = [
 
 interface Settings {
   agencyName: string;
+  senderName: string;
+  mapStyle: MapStyle;
   services: string[];
   sort: SortKey;
   limit: number;
 }
-const DEFAULT_SETTINGS: Settings = { agencyName: "ZYRA", services: SERVICES.map(([id]) => id), sort: "agency", limit: 300 };
+const DEFAULT_SETTINGS: Settings = { agencyName: "Digital Zyra", senderName: "Kilian", mapStyle: "dark", services: SERVICES.map(([id]) => id), sort: "agency", limit: 300 };
 
 function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem("oos-settings");
-    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    if (raw) {
+      const v = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+      if (v.agencyName === "ZYRA") v.agencyName = DEFAULT_SETTINGS.agencyName; // valor antiguo
+      return v;
+    }
   } catch {}
   return { ...DEFAULT_SETTINGS };
 }
@@ -119,7 +135,6 @@ const state = {
   filters: { minScore: 0, opp: "", sort: loadSettings().sort as SortKey },
   batch: null as null | { done: number; total: number },
   map: null as MapAdapter | null,
-  mapNote: "",
   config: null as null | AppConfig,
   quick: "all" as QuickFilter,
   shown: 60,
@@ -285,6 +300,10 @@ function currentResult(r: SearchResult): { score: OpportunityScore; recommended:
   return a ? { score: a.score, recommended: a.recommended, opportunities: a.opportunities, analyzed: true } : { score: r.score, recommended: r.recommended, opportunities: r.opportunities, analyzed: false };
 }
 
+const systemOf = (r: SearchResult): string | null => {
+  const a = state.analyses.get(r.company.id);
+  return a ? (a.opportunities.find((o) => o.system)?.title ?? null) : (r.system ?? null);
+};
 const hasBookingGap = (r: SearchResult) => currentResult(r).opportunities.some((o) => o.id === "booking");
 const fewReviews = (r: SearchResult) => r.company.reviews !== undefined && r.company.reviews < 25;
 const matchesMine = (r: SearchResult, mine: Set<string>) => currentResult(r).opportunities.some((o) => mine.has(o.id));
@@ -299,6 +318,7 @@ function visibleResults(): SearchResult[] {
     if (c.score.score < minScore) return false;
     if (opp && !c.opportunities.some((o) => o.id === opp)) return false;
     if (q === "noweb" && r.company.website) return false;
+    if (q === "system" && !systemOf(r)) return false;
     if (q === "nobooking" && !hasBookingGap(r)) return false;
     if (q === "fewreviews" && !fewReviews(r)) return false;
     if (q === "phone" && !r.company.phone) return false;
@@ -357,6 +377,7 @@ function renderResultsArea() {
   const all = d.results;
   const nNoWeb = all.filter((r) => !r.company.website).length;
   const nNoBooking = all.filter(hasBookingGap).length;
+  const nSystem = all.filter((r) => !!systemOf(r)).length;
   const nFew = all.filter(fewReviews).length;
   const nPhone = all.filter((r) => !!r.company.phone).length;
   const mine = myOppIds();
@@ -368,6 +389,7 @@ function renderResultsArea() {
     <div class="stats" role="group" aria-label="Filtros rápidos">
       ${stat("all", all.length, "Negocios", "Ver todos")}
       ${stat("noweb", nNoWeb, "Sin web", "Negocios sin página web registrada")}
+      ${stat("system", nSystem, "Falta un sistema", "Les falta un sistema de comunicación o de reservas: clientes que se quejan de que no cogen el teléfono, esperas, citas perdidas… El motivo de la llamada")}
       ${stat("nobooking", nNoBooking, "Sin reservas online", "Trabajan con citas y no tienen reserva online")}
       ${stat("fewreviews", nFew, "Pocas reseñas", "Menos de 25 reseñas en Google")}
       ${stat("phone", nPhone, "Con teléfono", "Se les puede llamar")}
@@ -397,10 +419,9 @@ function renderResultsArea() {
     </div>
     ${warn}
     <div id="batch-progress"></div>
-    <div id="map-msg"></div>
     <div class="split">
       <div class="results" id="results"></div>
-      <div class="map-wrap"><div id="map"></div><div class="map-note" id="map-note">Cargando mapa…</div></div>
+      <div class="map-wrap"><div id="map"></div></div>
     </div>`;
 
   $("#f-min")!.addEventListener("input", (e) => {
@@ -454,7 +475,8 @@ function cardHtml(r: SearchResult): string {
       <div class="meta">${esc(c.sectorLabel)}${c.address ? ` · ${esc(c.address)}` : ""}${c.city ? ` · ${esc(c.city)}` : ""}${c.phone ? ` · <a href="tel:${esc(c.phone.replace(/\s/g, ""))}">${esc(c.phone)}</a>` : ""}</div>
       <div style="margin:6px 0">${presenceBadges(c)}</div>
       <div class="reco">Solución: <b>${esc(cur.recommended)}</b> ${status}</div>
-      ${!c.website ? `<div class="tag tag-hot">Sin web · oportunidad directa</div>` : fit ? `<div class="tag">Puedes ofrecer: ${esc(fit.title)}</div>` : ""}
+      <div class="tags">${!c.website ? `<span class="tag tag-hot">Sin web · oportunidad directa</span>` : ""}${systemOf(r) ? `<span class="tag tag-sys">Falta: ${esc(systemOf(r)!)}</span>` : ""}${c.website && !systemOf(r) && fit ? `<span class="tag">Puedes ofrecer: ${esc(fit.title)}</span>` : ""}</div>
+      ${c.complaints?.length ? `<div class="complaint">«${esc(c.complaints[0].quote.replace(/^…|…$/g, ""))}» <small>— reseña de Google</small></div>` : ""}
       <ul class="reasons">${reasons.map((i) => `<li>${esc(i.reason)}</li>`).join("")}</ul>
     </div>
     ${scoreRing(cur.score.score)}
@@ -558,14 +580,12 @@ function exportCsv() {
 }
 
 // ---------- Mapa ----------
-// Google Maps si hay clave (se ve como Google Maps de verdad); si no, o si Google falla, MapLibre + OpenFreeMap.
+// Solo Google Maps. Estilos tipo iPhone (oscuro o claro) o Google clásico; pines con el score y agrupación.
 
 declare const google: any;
 
-const MAPLIBRE_JS = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js";
-const MAPLIBRE_CSS = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css";
 let googleMapsPromise: Promise<boolean> | null = null;
-let maplibrePromise: Promise<boolean> | null = null;
+let clustererPromise: Promise<boolean> | null = null;
 let googleMapsFailed = false;
 
 function loadScript(src: string): Promise<boolean> {
@@ -586,8 +606,10 @@ function loadGoogleMaps(key: string): Promise<boolean> {
     // Google llama a esta función si la clave no vale o la API no está activada
     (window as any).gm_authFailure = () => {
       googleMapsFailed = true;
-      state.mapNote = "El mapa de Google no se ha podido cargar: activa «Maps JavaScript API» en Google Cloud para la misma clave. Mientras, se usa el mapa alternativo.";
-      if (state.data && $("#map")) initMap();
+      state.map?.destroy();
+      state.map = null;
+      const el = $("#map");
+      if (el) el.innerHTML = mapPlaceholder("Google no deja cargar el mapa con esta clave. Activa «Maps JavaScript API» en Google Cloud (misma clave) y recarga la página.");
     };
     loadScript(`https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&language=es&region=ES&loading=async&callback=__oosMapsReady`).then((ok) => {
       if (!ok) resolve(false);
@@ -597,14 +619,13 @@ function loadGoogleMaps(key: string): Promise<boolean> {
   return googleMapsPromise;
 }
 
-function loadMaplibre(): Promise<boolean> {
-  if (maplibrePromise) return maplibrePromise;
-  const css = document.createElement("link");
-  css.rel = "stylesheet";
-  css.href = MAPLIBRE_CSS;
-  document.head.appendChild(css);
-  maplibrePromise = loadScript(MAPLIBRE_JS);
-  return maplibrePromise;
+function loadClusterer(): Promise<boolean> {
+  clustererPromise ??= loadScript("https://unpkg.com/@googlemaps/markerclusterer@2.5.3/dist/index.min.js");
+  return clustererPromise;
+}
+
+function mapPlaceholder(msg: string): string {
+  return `<div class="map-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2Z"/><path d="M9 4v14M15 6v14"/></svg><p>${esc(msg)}</p><a class="btn btn-sm" href="#/ajustes">Ir a Ajustes</a></div>`;
 }
 
 function cssVar(name: string): string {
@@ -614,23 +635,65 @@ function scoreHex(v: number): string {
   return cssVar(v >= 70 ? "--high" : v >= 45 ? "--mid" : "--low");
 }
 
-const GOOGLE_DARK = [
-  { elementType: "geometry", stylers: [{ color: "#1d2128" }] },
-  { elementType: "labels.text.fill", stylers: [{ color: "#9aa3ad" }] },
-  { elementType: "labels.text.stroke", stylers: [{ color: "#111418" }] },
+/** Oscuro elegante, inspirado en el modo noche de Apple Maps */
+const MAP_DARK = [
+  { elementType: "geometry", stylers: [{ color: "#1c1c1e" }] },
+  { elementType: "labels.text.fill", stylers: [{ color: "#a1a1a6" }] },
+  { elementType: "labels.text.stroke", stylers: [{ color: "#1c1c1e" }, { weight: 3 }] },
+  { featureType: "administrative", elementType: "geometry.stroke", stylers: [{ color: "#3a3a3c" }] },
+  { featureType: "administrative.locality", elementType: "labels.text.fill", stylers: [{ color: "#e5e5ea" }] },
+  { featureType: "landscape.natural", elementType: "geometry", stylers: [{ color: "#202022" }] },
+  { featureType: "landscape.man_made", elementType: "geometry", stylers: [{ color: "#242426" }] },
   { featureType: "poi", stylers: [{ visibility: "off" }] },
-  { featureType: "road", elementType: "geometry", stylers: [{ color: "#2c333d" }] },
+  { featureType: "poi.park", stylers: [{ visibility: "on" }] },
+  { featureType: "poi.park", elementType: "geometry", stylers: [{ color: "#1e2a22" }] },
+  { featureType: "poi.park", elementType: "labels", stylers: [{ visibility: "off" }] },
+  { featureType: "road", elementType: "geometry", stylers: [{ color: "#2c2c2e" }] },
   { featureType: "road", elementType: "labels.icon", stylers: [{ visibility: "off" }] },
+  { featureType: "road", elementType: "labels.text.fill", stylers: [{ color: "#8e8e93" }] },
+  { featureType: "road.arterial", elementType: "geometry", stylers: [{ color: "#3a3a3c" }] },
+  { featureType: "road.highway", elementType: "geometry", stylers: [{ color: "#48484a" }] },
+  { featureType: "road.highway", elementType: "geometry.stroke", stylers: [{ color: "#1c1c1e" }] },
   { featureType: "transit", stylers: [{ visibility: "off" }] },
-  { featureType: "water", elementType: "geometry", stylers: [{ color: "#0e1a26" }] },
+  { featureType: "water", elementType: "geometry", stylers: [{ color: "#0b1e2e" }] },
+  { featureType: "water", elementType: "labels.text.fill", stylers: [{ color: "#4a6a85" }] },
 ];
-const GOOGLE_LIGHT = [
+/** Claro limpio, inspirado en Apple Maps de día */
+const MAP_LIGHT = [
+  { elementType: "geometry", stylers: [{ color: "#f5f3ef" }] },
+  { elementType: "labels.text.fill", stylers: [{ color: "#5b5b60" }] },
+  { elementType: "labels.text.stroke", stylers: [{ color: "#ffffff" }, { weight: 3 }] },
   { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "poi.park", stylers: [{ visibility: "on" }] },
+  { featureType: "poi.park", elementType: "geometry", stylers: [{ color: "#dcecd5" }] },
+  { featureType: "poi.park", elementType: "labels", stylers: [{ visibility: "off" }] },
+  { featureType: "road", elementType: "geometry", stylers: [{ color: "#ffffff" }] },
+  { featureType: "road", elementType: "labels.icon", stylers: [{ visibility: "off" }] },
+  { featureType: "road.highway", elementType: "geometry", stylers: [{ color: "#fde7a6" }] },
+  { featureType: "road.highway", elementType: "geometry.stroke", stylers: [{ color: "#f1cf6b" }] },
   { featureType: "transit", stylers: [{ visibility: "off" }] },
+  { featureType: "water", elementType: "geometry", stylers: [{ color: "#a9d3f2" }] },
 ];
 
+function mapStyles(): any[] | null {
+  const st = loadSettings().mapStyle;
+  if (st === "google") return null;
+  if (st === "dark") return MAP_DARK;
+  if (st === "light") return MAP_LIGHT;
+  return isDark() ? MAP_DARK : MAP_LIGHT; // "auto": sigue el tema de la app
+}
+
+/** Pin con el score dentro (SVG) */
+function pinIcon(score: number, active: boolean, noWeb: boolean) {
+  const color = scoreHex(score);
+  const w = active ? 40 : 32;
+  const h = Math.round(w * 1.25);
+  const ring = noWeb ? `<circle cx="20" cy="18" r="16.5" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-dasharray="4 3"/>` : "";
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 40 50"><path d="M20 49c-1.2 0-14-15.6-14-29a14 14 0 1 1 28 0c0 13.4-12.8 29-14 29Z" fill="rgba(0,0,0,.35)" transform="translate(0 1)"/><path d="M20 48C18.8 48 5 32.6 5 19a15 15 0 1 1 30 0c0 13.6-13.8 29-15 29Z" fill="${color}" stroke="#ffffff" stroke-width="2"/>${ring}<text x="20" y="23.5" text-anchor="middle" font-family="Inter Tight, Arial, sans-serif" font-size="13" font-weight="700" fill="#ffffff">${score}</text></svg>`;
+  return { url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`, scaledSize: new google.maps.Size(w, h), anchor: new google.maps.Point(w / 2, h - 1) };
+}
+
 interface MapAdapter {
-  kind: "google" | "maplibre";
   setMarkers(list: SearchResult[]): void;
   highlight(id: string | null): void;
   applyTheme(): void;
@@ -654,22 +717,29 @@ async function initMap() {
   destroyMap();
   await ensureConfig();
   if (token !== mapToken) return;
-  const key = state.config?.mapsKey;
-  const note = $("#map-note");
-  if (key && !googleMapsFailed && (await loadGoogleMaps(key)) && typeof google !== "undefined" && google.maps?.Map) {
-    if (token !== mapToken || !document.body.contains(el)) return;
-    state.map = googleAdapter(el);
-    if (note) note.textContent = "Google Maps";
-  } else {
-    if (!(await loadMaplibre()) || typeof maplibregl === "undefined") {
-      el.innerHTML = `<div class="map-fallback">No se pudo cargar el mapa. Los resultados siguen disponibles en la lista.</div>`;
-      return;
-    }
-    if (token !== mapToken || !document.body.contains(el)) return;
-    state.map = maplibreAdapter(el);
-    if (note) note.textContent = "Mapa © OpenStreetMap · OpenFreeMap";
+  const cfg = state.config;
+  const key = cfg?.mapsKey;
+  if (!key) {
+    el.innerHTML = mapPlaceholder(
+      cfg?.toggles && !cfg.toggles.googleMap
+        ? "El mapa de Google está desconectado. Actívalo en Ajustes → Conexiones."
+        : "Para ver el mapa de Google Maps añade GOOGLE_PLACES_API_KEY en Cloudflare (como Secreto) y activa «Maps JavaScript API» en Google Cloud.",
+    );
+    return;
   }
-  if (state.mapNote && $("#map-msg")) $("#map-msg")!.innerHTML = `<div class="notice" style="margin-bottom:10px">${esc(state.mapNote)}</div>`;
+  if (googleMapsFailed) {
+    el.innerHTML = mapPlaceholder("Google no deja cargar el mapa con esta clave. Activa «Maps JavaScript API» en Google Cloud (misma clave) y recarga la página.");
+    return;
+  }
+  el.innerHTML = `<div class="map-loading">Cargando Google Maps…</div>`;
+  const [ok] = await Promise.all([loadGoogleMaps(key), loadClusterer()]);
+  if (token !== mapToken || !document.body.contains(el)) return;
+  if (!ok || typeof google === "undefined" || !google.maps?.Map) {
+    el.innerHTML = mapPlaceholder("No se ha podido cargar Google Maps. Revisa tu conexión y recarga la página.");
+    return;
+  }
+  el.innerHTML = "";
+  state.map = googleAdapter(el);
   state.map.setMarkers(visibleResults());
 }
 
@@ -681,89 +751,69 @@ function googleAdapter(el: HTMLElement): MapAdapter {
     fullscreenControl: true,
     clickableIcons: false,
     gestureHandling: "greedy",
-    styles: isDark() ? GOOGLE_DARK : GOOGLE_LIGHT,
+    backgroundColor: isDark() ? "#1c1c1e" : "#f5f3ef",
+    styles: mapStyles(),
   });
   map.fitBounds({ south: s, west: w, north: n, east: e }, 30);
   const info = new google.maps.InfoWindow();
   let markers = new Map<string, any>();
-  const icon = (r: SearchResult, active: boolean) => ({
-    path: google.maps.SymbolPath.CIRCLE,
-    scale: active ? 10 : 7,
-    fillColor: scoreHex(currentResult(r).score.score),
-    fillOpacity: 1,
-    strokeColor: "#ffffff",
-    strokeWeight: 2,
-  });
   const byId = new Map<string, SearchResult>();
+  const MC = (window as any).markerClusterer?.MarkerClusterer;
+  const clusterRenderer = {
+    render({ count, position }: { count: number; position: any }) {
+      const size = count < 10 ? 34 : count < 50 ? 40 : 48;
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 48 48"><circle cx="24" cy="24" r="22" fill="#0d1117" fill-opacity=".85" stroke="#2ee6a6" stroke-width="3"/><text x="24" y="29" text-anchor="middle" font-family="Inter Tight, Arial, sans-serif" font-size="15" font-weight="700" fill="#ffffff">${count}</text></svg>`;
+      return new google.maps.Marker({ position, icon: { url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`, scaledSize: new google.maps.Size(size, size), anchor: new google.maps.Point(size / 2, size / 2) }, zIndex: 1000 + count });
+    },
+  };
+  let clusterer: any = MC ? new MC({ map, markers: [], renderer: clusterRenderer }) : null;
+  const iconFor = (r: SearchResult, active: boolean) => pinIcon(currentResult(r).score.score, active, !r.company.website);
   return {
-    kind: "google",
     setMarkers(list) {
+      clusterer?.clearMarkers();
       markers.forEach((m) => m.setMap(null));
       markers = new Map();
       byId.clear();
+      const all: any[] = [];
       for (const r of list) {
         byId.set(r.company.id, r);
-        const m = new google.maps.Marker({ position: { lat: r.company.lat, lng: r.company.lon }, map, title: `${r.company.name} · ${currentResult(r).score.score}`, icon: icon(r, state.activeId === r.company.id), zIndex: state.activeId === r.company.id ? 999 : 1 });
+        const active = state.activeId === r.company.id;
+        const m = new google.maps.Marker({ position: { lat: r.company.lat, lng: r.company.lon }, map: clusterer ? null : map, title: r.company.name, icon: iconFor(r, active), zIndex: active ? 999 : 1 });
         m.addListener("click", () => {
           setActive(r.company.id, true);
           const c = r.company;
-          info.setContent(`<div class="iw"><strong>${esc(c.name)}</strong><div>${esc(c.sectorLabel)} · score ${currentResult(r).score.score}</div>${c.rating !== undefined ? `<div>${c.rating.toFixed(1)} ★ · ${c.reviews ?? 0} reseñas</div>` : ""}<div>${c.website ? "Tiene web" : "<b>Sin web</b>"}${c.phone ? ` · ${esc(c.phone)}` : ""}</div><a href="#/empresa/${encodeURIComponent(c.id)}">Ver perfil →</a></div>`);
+          const cur = currentResult(r);
+          info.setContent(`<div class="iw"><strong>${esc(c.name)}</strong><div>${esc(c.sectorLabel)} · score ${cur.score.score}</div>${c.rating !== undefined ? `<div>${c.rating.toFixed(1)} ★ · ${c.reviews ?? 0} reseñas</div>` : ""}<div>${c.website ? "Tiene web" : "<b>Sin web</b>"}${c.phone ? ` · ${esc(c.phone)}` : ""}</div>${r.system ? `<div class="iw-sys">Falta: ${esc(r.system)}</div>` : ""}<a href="#/empresa/${encodeURIComponent(c.id)}">Ver perfil →</a></div>`);
           info.open({ anchor: m, map });
         });
         markers.set(r.company.id, m);
+        all.push(m);
       }
+      clusterer?.addMarkers(all);
     },
     highlight(id) {
       markers.forEach((m, mid) => {
         const r = byId.get(mid);
         if (!r) return;
-        m.setIcon(icon(r, mid === id));
+        m.setIcon(iconFor(r, mid === id));
         m.setZIndex(mid === id ? 999 : 1);
       });
+      const m = id ? markers.get(id) : null;
+      if (m && clusterer) {
+        // Si el pin está dentro de un grupo, acerca el mapa para verlo
+        const pos = m.getPosition();
+        if (pos && !map.getBounds()?.contains(pos)) map.panTo(pos);
+      }
     },
     applyTheme() {
-      map.setOptions({ styles: isDark() ? GOOGLE_DARK : GOOGLE_LIGHT });
+      map.setOptions({ styles: mapStyles(), backgroundColor: isDark() ? "#1c1c1e" : "#f5f3ef" });
     },
     destroy() {
+      clusterer?.clearMarkers();
+      clusterer = null;
       markers.forEach((m) => m.setMap(null));
       markers.clear();
       info.close();
-    },
-  };
-}
-
-function maplibreAdapter(el: HTMLElement): MapAdapter {
-  const [s, w, n, e] = state.data!.area.bbox;
-  const map = new maplibregl.Map({ container: el, style: "https://tiles.openfreemap.org/styles/positron", bounds: [[w, s], [e, n]], fitBoundsOptions: { padding: 30 }, attributionControl: { compact: true } });
-  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
-  const theme = () => {
-    const canvas = el.querySelector<HTMLElement>(".maplibregl-canvas");
-    if (canvas) canvas.style.filter = isDark() ? "invert(0.92) hue-rotate(180deg) saturate(0.6)" : "";
-  };
-  map.on("load", theme);
-  map.on("error", () => {});
-  let markers = new Map<string, any>();
-  return {
-    kind: "maplibre",
-    setMarkers(list) {
-      markers.forEach((m) => m.remove());
-      markers = new Map();
-      for (const r of list) {
-        const div = document.createElement("div");
-        div.className = `marker${state.activeId === r.company.id ? " is-active" : ""}`;
-        div.style.background = scoreColor(currentResult(r).score.score);
-        div.title = `${r.company.name} · ${currentResult(r).score.score}`;
-        div.addEventListener("click", () => setActive(r.company.id, true));
-        markers.set(r.company.id, new maplibregl.Marker({ element: div }).setLngLat([r.company.lon, r.company.lat]).addTo(map));
-      }
-    },
-    highlight(id) {
-      markers.forEach((m, mid) => m.getElement().classList.toggle("is-active", mid === id));
-    },
-    applyTheme: theme,
-    destroy() {
-      markers.forEach((m) => m.remove());
-      map.remove();
     },
   };
 }
@@ -886,9 +936,16 @@ function profileHtml(c: Company, a: Analysis | null, r: SearchResult): string {
       <div class="panel"><h2>Por qué este score</h2><div class="dims">${dims}</div><ul class="reason-list">${reasons}</ul></div>
       <div class="panel"><h2>Oportunidades detectadas</h2><div class="opps">${opps || `<p class="muted">Sin oportunidades claras con los datos disponibles.</p>`}</div></div>
       <div class="panel" id="gen-panel"><h2>Acción comercial</h2>
+        <p class="muted" style="margin:0 0 10px;font-size:13px">Elige qué quieres preparar y la IA lo escribe con los datos reales de este negocio, firmado por <b>${esc(loadSettings().senderName)}</b> de <b>${esc(loadSettings().agencyName)}</b>. Puedes editar el texto antes de copiarlo o enviarlo.</p>
         <div class="tabs" role="tablist">${(["propuesta", "email", "whatsapp", "linkedin", "llamada"] as const).map((k, i) => `<button class="tab" role="tab" data-kind="${k}" aria-selected="${i === 0}">${{ propuesta: "Propuesta", email: "Email", whatsapp: "WhatsApp", linkedin: "LinkedIn", llamada: "Guion de llamada" }[k]}</button>`).join("")}</div>
-        <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="btn btn-primary btn-sm" id="gen-btn" type="button">Generar con IA</button><button class="btn btn-sm" id="copy-btn" type="button" hidden>Copiar</button><span class="muted" id="gen-meta" style="font-size:12px"></span></div>
-        <div class="output" id="gen-out" aria-live="polite"><span class="muted">El texto se basa solo en las señales de esta página.</span></div>
+        <div class="gen-bar"><button class="btn btn-primary btn-sm" id="gen-btn" type="button">Generar con IA</button><span class="muted" id="gen-meta" style="font-size:12px"></span></div>
+        <textarea class="output" id="gen-out" rows="10" placeholder="Pulsa «Generar con IA». El texto se basa solo en lo que se ha detectado de este negocio." aria-label="Texto generado (editable)"></textarea>
+        <div class="gen-actions" id="gen-actions" hidden>
+          <button class="btn btn-sm" id="copy-btn" type="button">Copiar</button>
+          <a class="btn btn-sm" id="send-wa" target="_blank" rel="noopener noreferrer" hidden>Abrir en WhatsApp</a>
+          <a class="btn btn-sm" id="send-mail" hidden>Abrir en el correo</a>
+          <a class="btn btn-sm" id="send-call" hidden>Llamar</a>
+        </div>
         <p class="legal" id="gen-legal"></p>
       </div>
     </div>
@@ -913,46 +970,90 @@ function profileHtml(c: Company, a: Analysis | null, r: SearchResult): string {
   </div>`;
 }
 
+function waNumber(phone?: string): string | null {
+  if (!phone) return null;
+  let d = phone.replace(/[^\d+]/g, "");
+  if (d.startsWith("+")) d = d.slice(1);
+  else if (d.startsWith("00")) d = d.slice(2);
+  else if (/^[6-9]\d{8}$/.test(d)) d = "34" + d;
+  return /^\d{9,15}$/.test(d) ? d : null;
+}
+
 function bindProfile(c: Company) {
   let kind = "propuesta";
-  let lastText = "";
+  const texts = new Map<string, string>();
+  const out = () => $("#gen-out") as HTMLTextAreaElement;
+  const email = c.email ?? state.analyses.get(c.id)?.audit?.publicEmails[0];
+  const paintActions = () => {
+    const text = out().value.trim();
+    $("#gen-actions")!.hidden = !text;
+    const wa = $("#send-wa") as HTMLAnchorElement;
+    const mail = $("#send-mail") as HTMLAnchorElement;
+    const call = $("#send-call") as HTMLAnchorElement;
+    const num = waNumber(c.phone);
+    wa.hidden = !(kind === "whatsapp" && num);
+    if (num) wa.href = `https://wa.me/${num}?text=${encodeURIComponent(text)}`;
+    mail.hidden = kind !== "email";
+    if (kind === "email") {
+      const m = text.match(/^\s*asunto:\s*(.+)$/im);
+      const subject = m ? m[1].trim() : `Propuesta para ${c.name}`;
+      const body = m ? text.replace(m[0], "").trim() : text;
+      mail.href = `mailto:${encodeURIComponent(email ?? "")}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      mail.textContent = email ? `Abrir en el correo (${email})` : "Abrir en el correo";
+    }
+    call.hidden = !(kind === "llamada" && c.phone);
+    if (c.phone) call.href = `tel:${c.phone.replace(/\s/g, "")}`;
+  };
   const legal = () => {
     $("#gen-legal")!.textContent =
       kind === "email" || kind === "whatsapp"
         ? "Aviso legal (LSSI art. 21): no envíes este mensaje por email o WhatsApp a quien no te lo haya pedido o autorizado. Úsalo tras un primer contacto por teléfono o en persona, o si ya existe relación."
         : "";
   };
+  const generate = async () => {
+    const btn = $("#gen-btn") as HTMLButtonElement;
+    const k = kind;
+    btn.disabled = true;
+    btn.textContent = "Generando…";
+    out().value = "";
+    out().placeholder = "Escribiendo a partir de lo que se ha detectado de este negocio…";
+    try {
+      const st = loadSettings();
+      const res = await api<{ text: string; meta: { model: string; inputTokens: number; outputTokens: number; estimatedCostUsd: number | null } }>("/api/generate", { kind: k, company: c, agencyName: st.agencyName, senderName: st.senderName });
+      texts.set(k, res.text);
+      if (kind === k) {
+        out().value = res.text;
+        $("#gen-meta")!.textContent = res.meta.estimatedCostUsd ? `≈ ${res.meta.estimatedCostUsd.toFixed(4)} US$` : "IA gratuita";
+      }
+    } catch (e) {
+      out().placeholder = (e as Error).message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = texts.has(kind) ? "Regenerar" : "Generar con IA";
+      paintActions();
+    }
+  };
   legal();
   document.querySelectorAll<HTMLButtonElement>("#gen-panel .tab").forEach((t) =>
     t.addEventListener("click", () => {
+      texts.set(kind, out().value);
       kind = t.dataset.kind!;
       document.querySelectorAll("#gen-panel .tab").forEach((x) => x.setAttribute("aria-selected", String(x === t)));
       legal();
+      const prev = texts.get(kind);
+      out().value = prev ?? "";
+      ($("#gen-btn") as HTMLButtonElement).textContent = prev ? "Regenerar" : "Generar con IA";
+      paintActions();
+      // Al cambiar de pestaña, si aún no hay texto, se genera solo
+      if (!prev && texts.size > 0) generate();
     }),
   );
-  $("#gen-btn")?.addEventListener("click", async () => {
-    const btn = $("#gen-btn") as HTMLButtonElement;
-    const out = $("#gen-out")!;
-    btn.disabled = true;
-    btn.textContent = "Generando…";
-    out.innerHTML = `<span class="muted">Escribiendo a partir de las señales detectadas…</span>`;
-    try {
-      const res = await api<{ text: string; meta: { model: string; inputTokens: number; outputTokens: number; estimatedCostUsd: number | null } }>("/api/generate", { kind, company: c });
-      lastText = res.text;
-      out.textContent = res.text;
-      ($("#copy-btn") as HTMLButtonElement).hidden = false;
-      $("#gen-meta")!.textContent = `${res.meta.model} · ${res.meta.inputTokens + res.meta.outputTokens} tokens${res.meta.estimatedCostUsd != null ? ` · ≈ ${res.meta.estimatedCostUsd.toFixed(4)} US$` : ""}`;
-    } catch (e) {
-      out.innerHTML = errorBox(e as ApiError);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "Generar con IA";
-    }
-  });
+  $("#gen-btn")?.addEventListener("click", generate);
+  $("#gen-out")?.addEventListener("input", paintActions);
   $("#copy-btn")?.addEventListener("click", async () => {
     try {
-      await navigator.clipboard.writeText(lastText);
-      $("#copy-btn")!.textContent = "Copiado";
+      await navigator.clipboard.writeText(out().value);
+      $("#copy-btn")!.textContent = "Copiado ✓";
       setTimeout(() => ($("#copy-btn")!.textContent = "Copiar"), 1500);
     } catch {}
   });
@@ -1000,7 +1101,10 @@ async function renderSettings() {
     <div class="eyebrow">Ajustes</div><h1 class="hero">Configura tu OpportunityOS</h1>
     <form class="panel" id="settings-form">
       <h2>Tu agencia</h2>
-      <label class="field"><span>Nombre de tu agencia</span><input name="agencyName" value="${esc(st.agencyName)}" maxlength="60"></label>
+      <div class="field-row">
+        <label class="field"><span>Nombre de tu agencia (firma de los textos)</span><input name="agencyName" value="${esc(st.agencyName)}" maxlength="60"></label>
+        <label class="field"><span>Tu nombre</span><input name="senderName" value="${esc(st.senderName)}" maxlength="60"></label>
+      </div>
       <p class="muted" style="margin:14px 0 8px">Servicios que ofreces: los negocios que los necesitan se marcan con «Puedes ofrecer» y aparecen en el filtro «Encajan contigo».</p>
       <div class="checks">${SERVICES.map(([id, label]) => `<label class="check"><input type="checkbox" name="svc" value="${id}"${st.services.includes(id) ? " checked" : ""}><span>${esc(label)}</span></label>`).join("")}</div>
       <h2 style="margin-top:22px">Búsqueda</h2>
@@ -1017,6 +1121,17 @@ async function renderSettings() {
           .join("")}</select></label>
         <label class="field"><span>Resultados por búsqueda</span><select name="limit">${[100, 200, 300, 500].map((n) => `<option value="${n}"${st.limit === n ? " selected" : ""}>${n}</option>`).join("")}</select></label>
       </div>
+      <h2 style="margin-top:22px">Mapa</h2>
+      <div class="map-styles">${(
+        [
+          ["dark", "Oscuro", "Estilo iPhone de noche"],
+          ["light", "Claro", "Estilo iPhone de día"],
+          ["auto", "Automático", "Sigue el tema de la app"],
+          ["google", "Google clásico", "El de siempre"],
+        ] as Array<[MapStyle, string, string]>
+      )
+        .map(([v, l, d]) => `<label class="map-style ms-${v}"><input type="radio" name="mapStyle" value="${v}"${st.mapStyle === v ? " checked" : ""}><span class="ms-swatch"></span><strong>${l}</strong><small>${d}</small></label>`)
+        .join("")}</div>
       <div style="display:flex;gap:10px;align-items:center;margin-top:16px"><button class="btn btn-primary" type="submit">Guardar ajustes</button><span class="muted" id="settings-saved" aria-live="polite"></span></div>
       <p class="muted" style="font-size:12.5px;margin:10px 0 0">Se guardan en este navegador.</p>
     </form>
@@ -1027,6 +1142,8 @@ async function renderSettings() {
     const f = new FormData(ev.target as HTMLFormElement);
     const next: Settings = {
       agencyName: String(f.get("agencyName") ?? "").trim() || DEFAULT_SETTINGS.agencyName,
+      senderName: String(f.get("senderName") ?? "").trim() || DEFAULT_SETTINGS.senderName,
+      mapStyle: (String(f.get("mapStyle") ?? "dark") as MapStyle) || "dark",
       services: f.getAll("svc").map(String),
       sort: String(f.get("sort")) as SortKey,
       limit: Number(f.get("limit")) || 300,
@@ -1041,18 +1158,45 @@ async function renderSettings() {
     const cfg = (await ensureConfig())!;
     if (!cfg) throw new Error("No se pudo leer la configuración");
     const i = cfg.integrations;
-    const row = (ok: boolean, name: string, desc: string, variable: string) =>
-      `<li><div><span class="dot${ok ? " ok" : ""}"></span><strong>${name}</strong><div class="muted" style="font-size:13px;margin-left:16px">${desc}</div></div><div class="muted" style="font-size:12.5px;text-align:right">${ok ? "Conectado" : `Falta <code class="mono">${variable}</code>`}</div></li>`;
+    const t: Toggles = cfg.toggles ?? { googleSearch: true, googleMap: true, osm: true, ai: true };
+    const sw = (key: keyof Toggles | null, on: boolean, ready: boolean, name: string, desc: string, missing: string) => `<li>
+        <div><span class="dot${on && ready ? " ok" : ""}"></span><strong>${name}</strong><div class="muted" style="font-size:13px;margin-left:16px">${desc}</div>${!ready && missing ? `<div class="warn-line">Falta <code class="mono">${missing}</code> en Cloudflare (como Secreto)</div>` : ""}</div>
+        ${key ? `<label class="switch" title="${on ? "Desconectar" : "Conectar"}"><input type="checkbox" data-toggle="${key}"${on ? " checked" : ""}${cfg.canToggle ? "" : " disabled"}><span></span><em>${on ? "Conectado" : "Desconectado"}</em></label>` : `<span class="muted" style="font-size:12.5px">${ready ? "Conectado" : "—"}</span>`}
+      </li>`;
     $("#cfg")!.innerHTML = `<ul class="status-list">
-      ${row(i.googlePlaces, "Google Maps · búsqueda", `Fuente principal: prácticamente todos los negocios de la zona, con teléfono, web, valoración y reseñas. Hasta ${i.googleMaxCalls ?? 12} consultas por búsqueda (1.000 gratis al mes).`, "GOOGLE_PLACES_API_KEY")}
-      ${row(!!i.googleMaps && !googleMapsFailed, "Google Maps · mapa", googleMapsFailed ? "La clave no tiene activada «Maps JavaScript API». Actívala en Google Cloud (misma clave) y recarga." : "Mapa de Google en los resultados (10.000 cargas gratis al mes). Si falla, se usa un mapa alternativo.", "GOOGLE_PLACES_API_KEY")}
-      ${row(true, "OpenStreetMap", "Zonas y negocios gratis. Completa los datos de Google (email, redes). Siempre activo.", "")}
-      ${row(i.ai, `IA${i.aiProvider ? ` · ${esc(i.aiProvider)}` : ""}`, i.aiFree ? "Asistente y textos comerciales (propuestas, emails, WhatsApp, guiones). IA gratuita de Cloudflare con límite diario; con ANTHROPIC_API_KEY usa Claude." : "Propuestas, emails, WhatsApp, LinkedIn y guiones de llamada.", "ANTHROPIC_API_KEY")}
-      ${row(!!i.contactEmail, "Email de contacto (opcional)", "Recomendado por la política de uso de OpenStreetMap. Sin él, la búsqueda funciona igual.", "CONTACT_EMAIL")}
-    </ul><p class="muted" style="margin-top:14px;font-size:13px">Las claves se añaden en Cloudflare → Workers → opportunity-os → Settings → Variables and Secrets (tipo Secret). Reglas del Opportunity Engine: versión <span class="mono">${esc(cfg.rulesVersion)}</span>.</p>`;
+      ${sw("googleSearch", t.googleSearch, i.googlePlaces, "Google Maps · búsqueda", `Fuente principal: prácticamente todos los negocios, con teléfono, web, valoración y reseñas (también detecta quejas). Hasta ${i.googleMaxCalls ?? 12} consultas por búsqueda; 1.000 gratis al mes.`, "GOOGLE_PLACES_API_KEY")}
+      ${sw("googleMap", t.googleMap, !!i.googleMaps && !googleMapsFailed, "Google Maps · mapa", googleMapsFailed ? "La clave no tiene activada «Maps JavaScript API». Actívala en Google Cloud (misma clave) y recarga." : "Mapa de los resultados (10.000 cargas gratis al mes).", "GOOGLE_PLACES_API_KEY")}
+      ${sw("osm", t.osm, true, "OpenStreetMap · búsqueda", "Datos gratis que completan los de Google (email, redes) y añaden negocios que Google no devuelve.", "")}
+      ${sw("ai", t.ai, i.ai, `IA${i.aiProvider ? ` · ${esc(i.aiProvider)}` : ""}`, i.aiFree ? "Asistente y textos comerciales. IA gratuita de Cloudflare con límite diario; con ANTHROPIC_API_KEY usa Claude." : "Asistente y textos comerciales.", "ANTHROPIC_API_KEY")}
+      ${sw(null, !!i.contactEmail, !!i.contactEmail, "Email de contacto (opcional)", "Recomendado por la política de uso de OpenStreetMap. Sin él, la búsqueda funciona igual.", "CONTACT_EMAIL")}
+    </ul>${cfg.canToggle ? "" : `<p class="warn-line">Los interruptores se activan al publicar esta versión (falta el almacén de ajustes).</p>`}<p class="muted" style="margin-top:14px;font-size:13px">Las claves se añaden en Cloudflare → Workers → opportunity-os → Settings → Variables and Secrets, siempre como <b>Secreto</b>. Reglas del Opportunity Engine: versión <span class="mono">${esc(cfg.rulesVersion)}</span>.</p>`;
+    $("#cfg")!.querySelectorAll<HTMLInputElement>("[data-toggle]").forEach((inp) =>
+      inp.addEventListener("change", async () => {
+        inp.disabled = true;
+        try {
+          const res = await api<{ toggles: Toggles }>("/api/admin/toggles", { [inp.dataset.toggle!]: inp.checked });
+          const cfg2 = await (async () => {
+            state.config = null;
+            return ensureConfig();
+          })();
+          if (cfg2) cfg2.toggles = res.toggles;
+          googleMapsFailed = false;
+          renderSettings();
+        } catch (e) {
+          inp.checked = !inp.checked;
+          inp.disabled = false;
+          alertBox(e as ApiError);
+        }
+      }),
+    );
   } catch (e) {
     $("#cfg")!.innerHTML = errorBox(e as ApiError);
   }
+}
+
+function alertBox(e: ApiError) {
+  const c = $("#cfg");
+  if (c) c.insertAdjacentHTML("afterbegin", errorBox(e));
 }
 
 // ---------- Ayuda y contacto ----------
@@ -1091,7 +1235,11 @@ async function renderHelp() {
 
 // ---------- Asistente ----------
 
-const ASSISTANT_SUGGESTIONS = ["¿Cómo encuentro negocios sin web?", "¿Qué significa el score?", "¿Cuánto me cuesta Google?", "¿Cómo preparo una llamada de venta?"];
+function assistantSuggestions(): string[] {
+  if (location.hash.startsWith("#/empresa/")) return ["¿Qué le ofrezco a este negocio?", "Escríbeme un guion de llamada", "¿Qué objeciones puede poner?", "Resúmeme sus puntos débiles"];
+  if (state.data) return ["¿A cuáles llamo primero?", "¿Qué les vendo a los que no tienen web?", "¿Qué significa «Falta un sistema»?", "Escribe un WhatsApp para el primero"];
+  return ["¿Cómo encuentro negocios sin web?", "¿Qué significa el score?", "¿Cuánto me cuesta Google?", "¿Cómo preparo una llamada de venta?"];
+}
 
 function renderAssistantLog() {
   const log = $("#assistant-log");
@@ -1103,8 +1251,44 @@ function renderAssistantLog() {
     (state.chatBusy ? `<div class="msg msg-a msg-typing"><span></span><span></span><span></span></div>` : "");
   log.scrollTop = log.scrollHeight;
   const sug = $("#assistant-suggest");
-  if (sug) sug.innerHTML = state.chat.length ? "" : ASSISTANT_SUGGESTIONS.map((q) => `<button type="button" class="chip chip-soft" data-ask="${esc(q)}">${esc(q)}</button>`).join("");
+  if (sug) sug.innerHTML = state.chat.length ? "" : assistantSuggestions().map((q) => `<button type="button" class="chip chip-soft" data-ask="${esc(q)}">${esc(q)}</button>`).join("");
   sug?.querySelectorAll<HTMLButtonElement>("[data-ask]").forEach((b) => b.addEventListener("click", () => askAssistant(b.dataset.ask!)));
+}
+
+/** Lo que el usuario está viendo, para que el asistente responda sobre ello */
+function screenContext(): string {
+  const h = location.hash;
+  const mine = SERVICES.filter(([id]) => loadSettings().services.includes(id)).map(([, l]) => l).join(", ");
+  const lines: string[] = [`Servicios que ofrece la agencia: ${mine || "(sin indicar)"}.`];
+  if (h.startsWith("#/empresa/")) {
+    const id = decodeURIComponent(h.slice("#/empresa/".length));
+    const r = findCompany(id);
+    if (r) {
+      const c = r.company;
+      const a = state.analyses.get(id);
+      const cur = currentResult(r);
+      lines.push(`Pantalla: perfil del negocio «${c.name}» (${c.sectorLabel}${c.city ? `, ${c.city}` : ""}).`);
+      lines.push(`Datos: teléfono ${c.phone ?? "no publicado"}; web ${c.website ?? "no tiene"}; email ${c.email ?? "no publicado"}; ${c.rating !== undefined ? `Google ${c.rating.toFixed(1)} ★ con ${c.reviews ?? 0} reseñas` : "sin datos de Google"}; horario ${c.openingHours ?? "no publicado"}.`);
+      lines.push(`Opportunity Score: ${cur.score.score}/100. Solución recomendada: ${cur.recommended}.`);
+      lines.push(`Oportunidades: ${cur.opportunities.map((o) => `${o.title} (${o.priority}): ${o.problem}`).join(" | ") || "ninguna"}.`);
+      if (c.complaints?.length) lines.push(`Quejas en reseñas: ${c.complaints.map((k) => `«${k.quote}»`).join(" ")}`);
+      if (a) lines.push(`Señales verificadas: ${a.signals.filter((x) => x.confidence === "verificado").map((x) => x.label).join("; ")}.`);
+    }
+  } else if (state.data && (h === "" || h === "#/" || h.startsWith("#/?"))) {
+    const d = state.data;
+    const list = visibleResults();
+    lines.push(`Pantalla: resultados de «${d.parsed.raw}» en ${d.area.label}: ${d.results.length} negocios (${d.results.filter((r) => !r.company.website).length} sin web, ${d.results.filter((r) => !!systemOf(r)).length} con falta de un sistema).`);
+    lines.push(
+      "Primeros de la lista: " +
+        list
+          .slice(0, 12)
+          .map((r) => `${r.company.name} (score ${currentResult(r).score.score}${r.company.website ? "" : ", sin web"}${systemOf(r) ? `, falta ${systemOf(r)}` : ""}${r.company.phone ? `, tel ${r.company.phone}` : ""})`)
+          .join("; "),
+    );
+  } else {
+    lines.push(`Pantalla: ${h.startsWith("#/ajustes") ? "Ajustes" : h.startsWith("#/ayuda") ? "Ayuda y contacto" : "buscador sin resultados"}.`);
+  }
+  return lines.join("\n").slice(0, 3800);
 }
 
 async function askAssistant(text: string) {
@@ -1114,7 +1298,8 @@ async function askAssistant(text: string) {
   state.chatBusy = true;
   renderAssistantLog();
   try {
-    const res = await api<{ text: string; meta: { model: string } }>("/api/assistant", { messages: state.chat.slice(-10) });
+    const st = loadSettings();
+    const res = await api<{ text: string; meta: { model: string } }>("/api/assistant", { messages: state.chat.slice(-10), context: screenContext(), agencyName: st.agencyName, senderName: st.senderName });
     state.chat.push({ role: "assistant", content: res.text });
   } catch (e) {
     state.chat.push({ role: "assistant", content: `No he podido responder: ${(e as Error).message}` });

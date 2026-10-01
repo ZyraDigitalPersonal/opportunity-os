@@ -139,13 +139,14 @@ const KIND_INSTRUCTIONS: Record<GenerationKind, string> = {
   llamada: "Escribe un guion de llamada: apertura (15 s), motivo con el hallazgo concreto, 3 preguntas de descubrimiento, cómo presentar la solución y 2 objeciones típicas con respuesta. Formato en viñetas.",
 };
 
-export function buildGenerationPrompt(a: Analysis, kind: GenerationKind, senderName: string): AIRequest {
+export function buildGenerationPrompt(a: Analysis, kind: GenerationKind, senderName: string, agencyName = "Digital Zyra"): AIRequest {
   const verified = a.signals.filter((s) => s.confidence === "verificado").map((s) => `- [${s.key}] ${s.label}${s.evidence ? ` (${s.evidence})` : ""} — fuente: ${s.source}`);
   const inferred = a.signals.filter((s) => s.confidence === "inferido").map((s) => `- [${s.key}] ${s.label} — fuente: ${s.source}`);
   const ops = a.opportunities.slice(0, 4).map((o) => `- (${o.priority}) ${o.title}: ${o.problem} → ${o.solution}`);
   const system = [
-    "Eres un consultor de digitalización que escribe en español de España para pequeños negocios.",
+    `Eres ${senderName}, de ${agencyName}, una agencia de digitalización de negocios (webs, sistemas de reservas, agentes de voz con IA que atienden llamadas, chatbots y automatizaciones). Escribes en español de España para pequeños negocios.`,
     "REGLAS ESTRICTAS:",
+    `0. La agencia se llama exactamente «${agencyName}» y quien firma es «${senderName}». No uses otros nombres para la agencia ni uses direcciones de email o nombres de usuario como nombre.`,
     "1. Usa solo los hechos de la lista VERIFICADOS. No inventes datos, cifras, reseñas, nombres de personas ni resultados.",
     "2. Los hechos INFERIDOS son hipótesis del sector: si los usas, preséntalos como posibilidad (\"es habitual que…\", \"quizá…\"), nunca como algo que sabes de ese negocio.",
     "3. Nada de frases genéricas de agencia (\"somos una agencia digital que hace webs\"). Empieza por lo que has observado del negocio.",
@@ -154,7 +155,7 @@ export function buildGenerationPrompt(a: Analysis, kind: GenerationKind, senderN
   ].join("\n");
   const prompt = [
     `NEGOCIO: ${a.company.name} — ${a.company.sectorLabel}${a.company.city ? ` en ${a.company.city}` : ""}`,
-    `REMITENTE: ${senderName}`,
+    `REMITENTE: ${senderName} (${agencyName})`,
     `OPPORTUNITY SCORE: ${a.score.score}/100`,
     "",
     "HECHOS VERIFICADOS:",
@@ -201,9 +202,10 @@ export const ZYRA_CONTACT = {
 };
 
 export const ASSISTANT_SYSTEM = [
-  "Eres el asistente de OpportunityOS, una herramienta de ZYRA (agencia de digitalización en España).",
+  "Eres el asistente de OpportunityOS, una herramienta de Digital Zyra (ZYRA), agencia de digitalización en España.",
   "Respondes en español de España, breve (máximo 120 palabras salvo que pidan detalle), claro y amable. Usa listas cortas cuando ayuden.",
-  "Solo hablas de OpportunityOS, de cómo usarlo y de captar clientes para servicios de digitalización. Si preguntan otra cosa, redirige con amabilidad.",
+  "Hablas de OpportunityOS, de cómo usarlo y de captar y atender clientes para servicios de digitalización: preparar llamadas, redactar emails, WhatsApp o propuestas, responder objeciones, decidir qué ofrecer a cada negocio y cómo priorizar. Si preguntan algo totalmente ajeno, redirige con amabilidad.",
+  "Cuando te den el CONTEXTO DE LA PANTALLA, úsalo: si el usuario está viendo un negocio, responde sobre ese negocio con sus datos reales (no inventes datos que no estén en el contexto). Si te piden un mensaje o guion, escríbelo listo para copiar.",
   "Si no sabes algo, dilo y ofrece el contacto de ZYRA. No inventes funciones que no existen.",
   "",
   "QUÉ HACE OPPORTUNITYOS:",
@@ -225,6 +227,16 @@ export const ASSISTANT_SYSTEM = [
 ].join("\n");
 
 /** Convierte una conversación en una sola petición para proveedores sin chat multi-turno. */
+/** System prompt del asistente con la agencia del usuario y lo que está viendo en pantalla. */
+export function assistantSystem(agencyName: string, senderName: string, context?: string): string {
+  return [
+    ASSISTANT_SYSTEM,
+    "",
+    `El usuario trabaja en la agencia «${agencyName}» y se llama «${senderName}». Si redactas mensajes, fírmalos así.`,
+    context ? `\nCONTEXTO DE LA PANTALLA (datos reales de la app):\n${context}` : "",
+  ].join("\n");
+}
+
 export function flattenChat(messages: ChatMessage[]): string {
   return messages.map((m) => `${m.role === "user" ? "Usuario" : "Asistente"}: ${m.content}`).join("\n\n") + "\n\nAsistente:";
 }

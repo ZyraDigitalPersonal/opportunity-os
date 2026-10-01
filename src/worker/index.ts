@@ -5,10 +5,10 @@ import { parseQuery, withAlternative, type ParsedQuery } from "../core/query-par
 import { GooglePlacesSearch, GOOGLE_CALL_USD } from "../core/google-search.js";
 import { mergeCompanies } from "../core/merge.js";
 import { OsmProvider, type DataProvider } from "../core/osm.js";
-import { analyzeCompany, RULES_VERSION } from "../core/opportunity-engine.js";
+import { analyzeCompany, RULES_VERSION, systemGap } from "../core/opportunity-engine.js";
 import { auditWebsite } from "../core/web-audit.js";
 import { fetchGooglePlace, GOOGLE_TEXT_SEARCH_USD } from "../core/google-places.js";
-import { ASSISTANT_SYSTEM, buildGenerationPrompt, createProvider, estimateCostUsd, flattenChat, freeProvider, ZYRA_CONTACT, type ChatMessage, type GenerationKind, type WorkersAIBinding } from "../core/ai.js";
+import { assistantSystem, buildGenerationPrompt, createProvider, estimateCostUsd, flattenChat, freeProvider, ZYRA_CONTACT, type ChatMessage, type GenerationKind, type WorkersAIBinding } from "../core/ai.js";
 import { ExternalError } from "../core/http.js";
 import { resolveSector } from "../core/sectors.js";
 import type { Analysis, Company, GeoArea, WebAudit } from "../core/types.js";
@@ -32,6 +32,10 @@ export interface Env {
   WORKERS_AI_MODEL?: string;
   /** Clave de navegador para el mapa de Google (restringida por dominio). Si falta, se usa GOOGLE_PLACES_API_KEY. */
   GOOGLE_MAPS_BROWSER_KEY?: string;
+  /** Firma por defecto de los textos */
+  AGENCY_NAME?: string;
+  /** KV con los interruptores de administrador */
+  SETTINGS?: { get(key: string): Promise<string | null>; put(key: string, value: string): Promise<void> };
   /** Solo para tests: permite inyectar proveedores */
   __deps?: Partial<Deps>;
 }
@@ -45,6 +49,40 @@ export interface Deps {
 
 interface Ctx {
   waitUntil(p: Promise<unknown>): void;
+}
+
+// ---------- Interruptores de administrador ----------
+
+export interface Toggles {
+  googleSearch: boolean;
+  googleMap: boolean;
+  osm: boolean;
+  ai: boolean;
+}
+export const DEFAULT_TOGGLES: Toggles = { googleSearch: true, googleMap: true, osm: true, ai: true };
+let togglesCache: { at: number; value: Toggles } | null = null;
+
+export async function getToggles(env: Env): Promise<Toggles> {
+  if (!env.SETTINGS) return { ...DEFAULT_TOGGLES };
+  if (togglesCache && Date.now() - togglesCache.at < 10_000) return togglesCache.value;
+  let value = { ...DEFAULT_TOGGLES };
+  try {
+    const raw = await env.SETTINGS.get("toggles");
+    if (raw) value = { ...DEFAULT_TOGGLES, ...JSON.parse(raw) };
+  } catch {}
+  togglesCache = { at: Date.now(), value };
+  return value;
+}
+
+async function handleAdminToggles(req: Request, env: Env) {
+  if (!env.SETTINGS) return fail(503, "Falta el almacén de ajustes (KV SETTINGS). Vuelve a publicar la app.");
+  const body = await readJson(req);
+  const cur = await getToggles(env);
+  const next: Toggles = { ...cur };
+  for (const k of Object.keys(DEFAULT_TOGGLES) as Array<keyof Toggles>) if (typeof body[k] === "boolean") next[k] = body[k];
+  await env.SETTINGS.put("toggles", JSON.stringify(next));
+  togglesCache = { at: Date.now(), value: next };
+  return json({ toggles: next });
 }
 
 const apiLimiter = new RateLimiter(60, 60_000);
@@ -61,7 +99,7 @@ function userAgent(env: Env, req?: Request): string {
   return `OpportunityOSBot/0.2 (+${site}${env.CONTACT_EMAIL ? `; ${env.CONTACT_EMAIL}` : ""})`;
 }
 
-function deps(env: Env, req?: Request): Deps {
+function deps(env: Env, req?: Request, toggles: Toggles = DEFAULT_TOGGLES): Deps {
   const fetchImpl = env.__deps?.fetchImpl ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const cfCaches = (globalThis as any).caches?.default;
   return {
@@ -70,7 +108,7 @@ function deps(env: Env, req?: Request): Deps {
     google:
       env.__deps?.google !== undefined
         ? env.__deps.google
-        : env.GOOGLE_PLACES_API_KEY
+        : env.GOOGLE_PLACES_API_KEY && toggles.googleSearch
           ? new GooglePlacesSearch({ apiKey: env.GOOGLE_PLACES_API_KEY, maxCalls: Math.min(Math.max(Number(env.GOOGLE_MAX_CALLS) || 12, 1), 60), fetchImpl })
           : null,
     cache: env.__deps?.cache !== undefined ? env.__deps.cache : cfCaches ?? null,
@@ -139,6 +177,12 @@ export function validateCompany(v: any): Company | null {
     rating: rating !== undefined && rating >= 0 && rating <= 5 ? rating : undefined,
     reviews: reviews !== undefined && reviews >= 0 ? Math.round(reviews) : undefined,
     alsoIn: str(v.alsoIn, 30),
+    complaints: Array.isArray(v.complaints)
+      ? v.complaints
+          .filter((k: any) => k && ["telefono", "esperas", "atencion"].includes(k.type) && typeof k.quote === "string")
+          .slice(0, 3)
+          .map((k: any) => ({ type: k.type, quote: k.quote.slice(0, 200) }))
+      : undefined,
   };
 }
 
@@ -182,14 +226,16 @@ async function handleSearch(req: Request, env: Env, ctx: Ctx) {
   const first = parseQuery(q);
   if (!first.location && !first.postcode) return fail(400, "Indica una zona: por ejemplo «… en Lleida», «… de Tenerife» o un código postal.", { parsed: first });
 
-  const d = deps(env, req);
+  const toggles = await getToggles(env);
+  const d = deps(env, req, toggles);
+  if (!toggles.osm && !d.google) return fail(503, "Todas las fuentes de búsqueda están desconectadas. Activa Google Maps u OpenStreetMap en Ajustes → Conexiones.");
   const { area, parsed } = await geocodeWithAlternatives(d, ctx, first);
   const sectors = parsed.sectorIds.map(resolveSector).filter((s): s is NonNullable<typeof s> => !!s);
   if (!sectors.length) return fail(400, "No he entendido el sector. Prueba con «dentistas», «restaurantes», «peluquerías»…", { parsed });
 
   const warnings: string[] = [];
   const sKey = `companies:v2:${area.overpassAreaId ?? area.bbox.join(",")}:${[...parsed.sectorIds].sort().join(",")}:${limit}`;
-  const osmTask = cached(d, ctx, sKey, 12 * 3600, () => d.data.searchCompanies(area, parsed.sectorIds, limit));
+  const osmTask = toggles.osm ? cached(d, ctx, sKey, 12 * 3600, () => d.data.searchCompanies(area, parsed.sectorIds, limit)) : Promise.resolve({ value: [] as Company[], hit: false });
   const googleTask = d.google ? d.google.searchCompanies(area, sectors, limit) : null;
   // Si Google ya ha respondido, OSM solo complementa: no se le espera más de 15 s
   const osmBounded = googleTask
@@ -209,14 +255,14 @@ async function handleSearch(req: Request, env: Env, ctx: Ctx) {
     if (osmR.status === "rejected") throw googleR.reason;
     warnings.push(`Google Places: ${(googleR.reason as Error).message} Se muestran solo los resultados de OpenStreetMap.`);
   }
-  if (!d.google) warnings.push("Solo OpenStreetMap: faltan negocios. Añade GOOGLE_PLACES_API_KEY para buscar en Google Maps y tener la lista completa.");
+  if (!d.google) warnings.push(env.GOOGLE_PLACES_API_KEY ? "Google Maps está desconectado en Ajustes → Conexiones: solo se busca en OpenStreetMap y faltan negocios." : "Solo OpenStreetMap: faltan negocios. La app no encuentra la variable GOOGLE_PLACES_API_KEY: añádela en Cloudflare como Secreto.");
   if (google?.truncated) warnings.push(`Zona muy grande: se ha parado en ${google.companies.length} negocios de Google para controlar el coste. Busca por municipio para verlos todos.`);
 
   const companies = google ? mergeCompanies(google.companies, osm) : osm;
 
   let results = companies.map((c) => {
     const a = analyzeCompany(c);
-    return { company: c, score: a.score, recommended: a.recommended, opportunities: a.opportunities.slice(0, 3) };
+    return { company: c, score: a.score, recommended: a.recommended, opportunities: a.opportunities.slice(0, 6), system: systemGap(a.opportunities) };
   });
   if (parsed.filters.withoutWebsite) results = results.filter((r) => !r.company.website);
   if (parsed.filters.withWebsite) results = results.filter((r) => !!r.company.website);
@@ -224,7 +270,7 @@ async function handleSearch(req: Request, env: Env, ctx: Ctx) {
   results.sort((a, b) => b.score.score - a.score.score);
   results = results.slice(0, limit);
 
-  const sources = [google && "Google Maps", osmR.status === "fulfilled" && "OpenStreetMap"].filter(Boolean) as string[];
+  const sources = [google && "Google Maps", toggles.osm && osmR.status === "fulfilled" && "OpenStreetMap"].filter(Boolean) as string[];
   const costUsd = google ? +(google.calls * GOOGLE_CALL_USD).toFixed(3) : 0;
   return json({
     parsed,
@@ -284,6 +330,7 @@ async function handleGenerate(req: Request, env: Env, ctx: Ctx) {
   if (!KINDS.includes(kind)) return fail(400, "Tipo de texto no válido.");
   const company = validateCompany(body.company);
   if (!company) return fail(400, "Empresa no válida.");
+  if (!(await getToggles(env)).ai) return fail(503, "La IA está desconectada en Ajustes → Conexiones.");
   const d = deps(env, req);
   const provider = createProvider(env, d.fetchImpl);
   if ("missing" in provider) return fail(503, `La IA no está configurada. Añade la variable ${provider.missing}.`, { missing: provider.missing });
@@ -296,14 +343,15 @@ async function handleGenerate(req: Request, env: Env, ctx: Ctx) {
     )).value;
   }
   const analysis: Analysis = analyzeCompany(company, audit);
-  const request = buildGenerationPrompt(analysis, kind, env.SENDER_NAME ?? "[tu nombre]");
+  const request = buildGenerationPrompt(analysis, kind, str(body.senderName, 60) ?? env.SENDER_NAME ?? "[tu nombre]", str(body.agencyName, 60) ?? env.AGENCY_NAME ?? "Digital Zyra");
   const out = await provider.generate(request);
   const cost = estimateCostUsd(out.model, out.inputTokens, out.outputTokens);
   return json({ text: out.text, kind, meta: { provider: out.provider, model: out.model, inputTokens: out.inputTokens, outputTokens: out.outputTokens, estimatedCostUsd: cost } });
 }
 
-function handleConfig(env: Env) {
+async function handleConfig(env: Env) {
   const ai = createProvider(env);
+  const toggles = await getToggles(env);
   return json({
     integrations: {
       openStreetMap: true,
@@ -316,7 +364,9 @@ function handleConfig(env: Env) {
       aiProvider: "missing" in ai ? null : `${ai.name} · ${ai.model}`,
     },
     // Solo para usuarios con sesión: carga el mapa de Google en el navegador
-    mapsKey: env.GOOGLE_MAPS_BROWSER_KEY ?? env.GOOGLE_PLACES_API_KEY ?? null,
+    mapsKey: toggles.googleMap ? (env.GOOGLE_MAPS_BROWSER_KEY ?? env.GOOGLE_PLACES_API_KEY ?? null) : null,
+    toggles,
+    canToggle: !!env.SETTINGS,
     contact: ZYRA_CONTACT,
     missing: [!env.GOOGLE_PLACES_API_KEY && "GOOGLE_PLACES_API_KEY", "missing" in ai && ai.missing, !env.CONTACT_EMAIL && "CONTACT_EMAIL"].filter(Boolean),
     rulesVersion: RULES_VERSION,
@@ -330,18 +380,20 @@ async function handleAssistant(req: Request, env: Env) {
     .filter((m: any) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
     .map((m: any) => ({ role: m.role, content: m.content.trim().slice(0, 1500) }));
   if (!messages.length || messages[messages.length - 1].role !== "user") return fail(400, "Escribe tu pregunta.");
+  if (!(await getToggles(env)).ai) return fail(503, "La IA está desconectada en Ajustes → Conexiones.");
+  const system = assistantSystem(str(body.agencyName, 60) ?? env.AGENCY_NAME ?? "Digital Zyra", str(body.senderName, 60) ?? env.SENDER_NAME ?? "", str(body.context, 4000));
   // El asistente usa la IA gratuita si existe; si no, la de pago configurada
   const free = freeProvider(env);
   let text: string;
   let model: string;
   if (free) {
-    const r = await free.chat(ASSISTANT_SYSTEM, messages, 500);
+    const r = await free.chat(system, messages, 700);
     text = r.text;
     model = r.model;
   } else {
     const provider = createProvider(env, deps(env, req).fetchImpl);
     if ("missing" in provider) return fail(503, "El asistente no está disponible: falta configurar la IA.", { missing: provider.missing });
-    const r = await provider.generate({ system: ASSISTANT_SYSTEM, prompt: flattenChat(messages), maxTokens: 500 });
+    const r = await provider.generate({ system, prompt: flattenChat(messages), maxTokens: 700 });
     text = r.text;
     model = r.model;
   }
@@ -394,7 +446,7 @@ export async function handle(req: Request, env: Env, ctx: Ctx): Promise<Response
   if (url.pathname.startsWith("/api/")) {
     if (!authed) return fail(401, "Sesión caducada. Vuelve a entrar.");
     if (!apiLimiter.allow(`api:${ip}`)) return fail(429, "Demasiadas peticiones. Espera un minuto.");
-    if (req.method === "GET" && url.pathname === "/api/config") return handleConfig(env);
+    if (req.method === "GET" && url.pathname === "/api/config") return await handleConfig(env);
     if (req.method !== "POST") return fail(405, "Método no permitido.");
     // Protección CSRF: las llamadas de la API deben venir de nuestro propio origen.
     const origin = req.headers.get("origin");
@@ -407,6 +459,8 @@ export async function handle(req: Request, env: Env, ctx: Ctx): Promise<Response
           return await handleAnalyze(req, env, ctx);
         case "/api/google":
           return await handleGoogle(req, env);
+        case "/api/admin/toggles":
+          return await handleAdminToggles(req, env);
         case "/api/assistant":
           if (!aiLimiter.allow(`ai:${ip}`)) return fail(429, "Demasiadas preguntas seguidas. Espera un minuto.");
           return await handleAssistant(req, env);

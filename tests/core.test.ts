@@ -310,3 +310,33 @@ test("engine: reseñas de Google generan oportunidad de reputación", () => {
 function area0() {
   return { label: "Lleida", overpassAreaId: 3600341409, bbox: [41.5, 0.5, 41.7, 0.7] as [number, number, number, number], center: [41.61, 0.62] as [number, number] };
 }
+
+// ---------- Reseñas y sistemas ----------
+
+import { detectComplaints } from "../src/core/reviews.js";
+import { systemGap } from "../src/core/opportunity-engine.js";
+
+test("reseñas: detecta que no cogen el teléfono y problemas con citas", () => {
+  const k = detectComplaints([
+    { rating: 2, text: "Buen trato, pero es imposible contactar con ellos, nunca cogen el teléfono." },
+    { rating: 3, text: "Me perdieron la cita dos veces y tuve que esperar más de una hora." },
+    { rating: 5, text: "No cogen el teléfono pero son geniales" },
+  ]);
+  assert.deepEqual(k.map((x) => x.type).sort(), ["esperas", "telefono"]);
+  assert.match(k.find((x) => x.type === "telefono")!.quote, /cogen el tel/);
+});
+
+test("engine: quejas de teléfono → falta un sistema de comunicación (prioridad alta)", () => {
+  const c: Company = { id: "gp:ChIJabcdefghij", name: "Pelu", sectorId: "peluqueria", sectorLabel: "Peluquería", lat: 1, lon: 1, phone: "922", source: "Google", sourceUrl: "x", rating: 4.1, reviews: 60, complaints: [{ type: "telefono", quote: "nunca cogen el teléfono" }] };
+  const a = analyzeCompany(c);
+  assert.equal(systemGap(a.opportunities), "Sistema de comunicación");
+  assert.equal(a.opportunities[0].id, "comm_system");
+  assert.ok(a.signals.some((s) => s.key === "complaint_telefono" && s.confidence === "verificado"));
+});
+
+test("IA: el prompt firma con el nombre de la agencia, no con el email", () => {
+  const c: Company = { id: "osm:node/1", name: "Bar", sectorId: "restaurante", sectorLabel: "Restaurante", lat: 1, lon: 1, source: "OpenStreetMap", sourceUrl: "x" };
+  const req = buildGenerationPrompt(analyzeCompany(c), "email", "Kilian", "Digital Zyra");
+  assert.match(req.system, /Kilian, de Digital Zyra/);
+  assert.match(req.system, /exactamente «Digital Zyra»/);
+});

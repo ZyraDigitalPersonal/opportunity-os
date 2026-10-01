@@ -12,9 +12,14 @@
   "observability": { "enabled": true },
   // IA gratuita de Cloudflare (Workers AI): asistente de ayuda y textos comerciales sin clave de pago
   "ai": { "binding": "AI" },
+  // Interruptores de administrador (Google, mapa, IA…) guardados en KV
+  "kv_namespaces": [{ "binding": "SETTINGS", "id": "efcaeafd8ee842808cdbd2002637990d" }],
+  // No borrar las variables que se añaden desde el panel de Cloudflare al publicar
+  "keep_vars": true,
   "vars": {
     "AI_PROVIDER": "anthropic",
-    "SENDER_NAME": "ZyraDigitalPersonal"
+    "SENDER_NAME": "Kilian",
+    "AGENCY_NAME": "Digital Zyra"
   }
   // Secretos (no van aquí): wrangler secret put APP_PASSWORD, SESSION_SECRET, CONTACT_EMAIL,
   // ANTHROPIC_API_KEY, GOOGLE_PLACES_API_KEY

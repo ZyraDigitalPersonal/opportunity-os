@@ -192,3 +192,22 @@ test("asistente e IA gratis con Workers AI cuando no hay clave de pago", async (
   assert.equal(c.integrations.ai, true);
   assert.equal(c.contact.email, "zyradigitalpersonal@gmail.com");
 });
+
+test("interruptores: desconectar Google y la IA desde Ajustes", async () => {
+  const cookie = await login();
+  const store = new Map<string, string>();
+  const SETTINGS = { get: async (k: string) => store.get(k) ?? null, put: async (k: string, v: string) => void store.set(k, v) };
+  const AI = { run: async () => ({ response: "hola" }) };
+  const envT: Env = { ...env, SETTINGS, AI, GOOGLE_PLACES_API_KEY: "k" };
+  const post = (path: string, body: unknown) => worker.fetch(new Request(`https://app.test${path}`, { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify(body) }), envT, ctx);
+  const r = await post("/api/admin/toggles", { googleMap: false, ai: false });
+  assert.equal(r.status, 200);
+  const cfg = (await (await worker.fetch(new Request("https://app.test/api/config", { headers: { cookie } }), envT, ctx)).json()) as any;
+  assert.equal(cfg.mapsKey, null);
+  assert.equal(cfg.toggles.ai, false);
+  const a = await post("/api/assistant", { messages: [{ role: "user", content: "hola" }] });
+  assert.equal(a.status, 503);
+  await post("/api/admin/toggles", { googleMap: true, ai: true });
+  const cfg2 = (await (await worker.fetch(new Request("https://app.test/api/config", { headers: { cookie } }), envT, ctx)).json()) as any;
+  assert.equal(cfg2.mapsKey, "k");
+});

@@ -10,6 +10,7 @@
 import type { Company, GeoArea } from "./types.js";
 import type { SectorProfile } from "./sectors.js";
 import { ExternalError, fetchWithTimeout } from "./http.js";
+import { detectComplaints } from "./reviews.js";
 
 const ENDPOINT = "https://places.googleapis.com/v1/places:searchText";
 
@@ -27,11 +28,12 @@ const FIELD_MASK = [
   "places.googleMapsUri",
   "places.businessStatus",
   "places.regularOpeningHours.weekdayDescriptions",
+  "places.reviews",
   "nextPageToken",
 ].join(",");
 
-/** Precio orientativo por llamada (Text Search Enterprise ≈ 35 US$ / 1.000; 1.000 gratis al mes). */
-export const GOOGLE_CALL_USD = 0.035;
+/** Precio orientativo por llamada (Text Search Enterprise + Atmosphere, por las reseñas ≈ 40 US$ / 1.000; 1.000 gratis al mes). */
+export const GOOGLE_CALL_USD = 0.04;
 
 export interface GoogleSearchOptions {
   apiKey: string;
@@ -61,6 +63,7 @@ interface GPlace {
   googleMapsUri?: string;
   businessStatus?: string;
   regularOpeningHours?: { weekdayDescriptions?: string[] };
+  reviews?: Array<{ rating?: number; text?: { text?: string }; originalText?: { text?: string } }>;
 }
 
 type BBox = [number, number, number, number]; // [sur, oeste, norte, este]
@@ -188,6 +191,7 @@ export function toCompany(p: GPlace, sector: SectorProfile, area: GeoArea): Comp
     googleMapsUri: p.googleMapsUri,
     rating: p.rating,
     reviews: p.userRatingCount ?? 0,
+    complaints: p.reviews?.length ? detectComplaints(p.reviews.map((r) => ({ rating: r.rating, text: r.originalText?.text ?? r.text?.text }))) : undefined,
   };
 }
 
