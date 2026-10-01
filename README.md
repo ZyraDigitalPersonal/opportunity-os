@@ -1,4 +1,4 @@
-# OpportunityOS · v0.1 (Entrega A)
+# OpportunityOS · v0.2
 
 Busca negocios por sector y zona, revisa su web pública y calcula un **Opportunity Score** con los motivos de cada punto, las oportunidades detectadas y la solución recomendada. Desde el perfil de cada empresa genera propuestas, emails, mensajes de WhatsApp o LinkedIn y guiones de llamada con IA.
 
@@ -10,7 +10,8 @@ Funciona en **Cloudflare Workers**, sin base de datos todavía. El frontend es T
 | --- | --- | --- |
 | Buscador en lenguaje natural («Peluquerías en Lleida que necesitan automatización») | Funciona | Reglas propias |
 | Zonas: ciudad, provincia, comunidad o código postal | Funciona | Nominatim (OpenStreetMap) |
-| Empresas en mapa y tarjetas, filtros por score y oportunidad | Funciona | Overpass (OpenStreetMap) |
+| Empresas en mapa y tarjetas, filtros por score y oportunidad | Funciona | Google Maps (con `GOOGLE_PLACES_API_KEY`) + OpenStreetMap, unidos sin duplicados |
+| Búsquedas escritas de cualquier forma («dentistas Lleida», «restaurantes de Tenerife», «tiendas de drones en Madrid») | Funciona | Reglas propias |
 | Auditoría web: HTTPS, móvil, velocidad, reservas online (Booksy, Treatwell, CoverManager, Doctoralia…), chat, WhatsApp, CTA, formularios, SEO básico, redes | Funciona | Web pública de cada negocio (respeta robots.txt) |
 | Opportunity Score con motivos marcados como *verificado* o *inferido* | Funciona | Opportunity Engine |
 | Oportunidades por prioridad y solución recomendada | Funciona | Opportunity Engine |
@@ -32,9 +33,9 @@ npm install
 npx wrangler login                        # abre el navegador para entrar en tu cuenta de Cloudflare
 npx wrangler secret put APP_PASSWORD      # la contraseña para entrar en la app
 npx wrangler secret put SESSION_SECRET    # 32+ caracteres aleatorios
-npx wrangler secret put CONTACT_EMAIL     # email de contacto (lo exige la política de uso de OpenStreetMap)
+npx wrangler secret put CONTACT_EMAIL     # opcional: email de contacto para OpenStreetMap
 npx wrangler secret put ANTHROPIC_API_KEY       # opcional: activa la generación de textos
-npx wrangler secret put GOOGLE_PLACES_API_KEY   # opcional: activa la ficha de Google
+npx wrangler secret put GOOGLE_PLACES_API_KEY   # recomendado: búsqueda completa en Google Maps
 npm run deploy
 ```
 
@@ -60,7 +61,7 @@ npm run typecheck
 ## Costes
 
 - OpenStreetMap (Nominatim + Overpass) y la auditoría web: 0 €. Son servicios públicos con uso razonable: la app cachea zonas 7 días y búsquedas 12 horas (la caché de Cloudflare puede no activarse en `workers.dev`; con un dominio propio sí).
-- Google Places: unos 0,035 US$ por ficha abierta, 1.000 gratis al mes. Solo se consulta al pulsar el botón y no se guarda.
+- Google Places: unos 0,035 US$ por consulta (cada una trae hasta 20 negocios), 1.000 gratis al mes. Una búsqueda usa como mucho `GOOGLE_MAX_CALLS` consultas (12 por defecto ≈ 0,42 US$). No se guarda nada de Google en servidor.
 - IA: se muestra el coste aproximado de cada texto generado. Los precios por modelo están en `src/core/ai.ts` (`MODEL_PRICES_USD_PER_MTOK`); revísalos con la tarifa actual de tu proveedor.
 
 ## Legal, en corto
