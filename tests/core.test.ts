@@ -340,3 +340,14 @@ test("IA: el prompt firma con el nombre de la agencia, no con el email", () => {
   assert.match(req.system, /Kilian, de Digital Zyra/);
   assert.match(req.system, /exactamente «Digital Zyra»/);
 });
+
+import { suggestNextAction, strengths } from "../src/core/crm.js";
+
+test("crm: siguiente acción según los datos de contacto", () => {
+  const base: Company = { id: "osm:node/1", name: "X", sectorId: "peluqueria", sectorLabel: "Peluquería", lat: 1, lon: 1, source: "OpenStreetMap", sourceUrl: "x" };
+  assert.equal(suggestNextAction({ ...base, phone: "922" }, []).action, "Llamar hoy");
+  assert.equal(suggestNextAction({ ...base, email: "a@b.es" }, []).channel, "email");
+  assert.equal(suggestNextAction(base, []).channel, "visita");
+  assert.equal(suggestNextAction({ ...base, phone: "922" }, [], "propuesta").action, "Hacer seguimiento de la propuesta");
+  assert.deepEqual(strengths([{ key: "booking_detected", label: "", confidence: "verificado", source: "" }]), ["Ya tiene reserva online"]);
+});

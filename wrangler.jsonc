@@ -13,6 +13,8 @@
   // IA gratuita de Cloudflare (Workers AI): asistente de ayuda y textos comerciales sin clave de pago
   "ai": { "binding": "AI" },
   // Interruptores de administrador (Google, mapa, IA…) guardados en KV
+  // Pipeline comercial (CRM)
+  "d1_databases": [{ "binding": "DB", "database_name": "opportunity-os-crm", "database_id": "2ae85530-d536-4e22-b86c-2dc4dc4006e2" }],
   "kv_namespaces": [{ "binding": "SETTINGS", "id": "efcaeafd8ee842808cdbd2002637990d" }],
   // No borrar las variables que se añaden desde el panel de Cloudflare al publicar
   "keep_vars": true,

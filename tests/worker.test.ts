@@ -211,3 +211,64 @@ test("interruptores: desconectar Google y la IA desde Ajustes", async () => {
   const cfg2 = (await (await worker.fetch(new Request("https://app.test/api/config", { headers: { cookie } }), envT, ctx)).json()) as any;
   assert.equal(cfg2.mapsKey, "k");
 });
+
+// ---------- Pipeline (CRM) con una D1 de prueba sobre SQLite ----------
+
+import { DatabaseSync } from "node:sqlite";
+
+function fakeD1() {
+  const db = new DatabaseSync(":memory:");
+  const stmt = (sql: string, vals: unknown[] = []) => ({
+    bind: (...v: unknown[]) => stmt(sql, v),
+    run: async () => db.prepare(sql).run(...(vals as any[])),
+    all: async () => ({ results: db.prepare(sql).all(...(vals as any[])) as any[] }),
+    first: async () => (db.prepare(sql).get(...(vals as any[])) as any) ?? null,
+  });
+  return { prepare: (sql: string) => stmt(sql) };
+}
+
+test("pipeline: guardar, registrar resultado de llamada, resumen de Hoy y borrar", async () => {
+  const cookie = await login();
+  const envC: Env = { ...env, DB: fakeD1() as any };
+  const call = (path: string, body?: unknown) =>
+    worker.fetch(new Request(`https://app.test${path}`, body === undefined ? { headers: { cookie } } : { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify(body) }), envC, ctx);
+  const today = new Date().toISOString().slice(0, 10);
+  let r = await call("/api/crm/save", { company: companies[0], status: "contactar", score: 70, nextDate: today, nextAction: "Llamar hoy" });
+  assert.equal(r.status, 200);
+  assert.equal(((await r.json()) as any).created, true);
+  r = await call("/api/crm/save", { company: companies[0] });
+  assert.equal(((await r.json()) as any).created, false);
+
+  let sm = (await (await call(`/api/crm/summary?today=${today}`)).json()) as any;
+  assert.equal(sm.total, 1);
+  assert.equal(sm.due.length, 1);
+
+  r = await call("/api/crm/update", { id: companies[0].id, status: "contactada", kind: "llamada", note: "No contesta", addDays: 2, nextAction: "Volver a llamar", valueEur: 900 });
+  const lead = ((await r.json()) as any).lead;
+  assert.equal(lead.status, "contactada");
+  assert.equal(lead.value_eur, 900);
+  assert.notEqual(lead.next_date, today);
+
+  const det = (await (await call(`/api/crm/lead?id=${encodeURIComponent(companies[0].id)}`)).json()) as any;
+  assert.ok(det.activities.some((a: any) => a.text === "No contesta" && a.to_status === "contactada"));
+
+  sm = (await (await call(`/api/crm/summary?today=${today}`)).json()) as any;
+  assert.equal(sm.due.length, 0);
+  assert.equal(sm.pipelineValue, 900);
+
+  await call("/api/crm/delete", { id: companies[0].id });
+  const list = (await (await call("/api/crm/leads")).json()) as any;
+  assert.equal(list.leads.length, 0);
+});
+
+test("pipeline: no guarda valoración ni reseñas de Google", async () => {
+  const cookie = await login();
+  const d1 = fakeD1();
+  const envC: Env = { ...env, DB: d1 as any };
+  const g = { id: "gp:ChIJabcdefghij", name: "Clínica G", sectorId: "clinica_dental", sectorLabel: "Clínica dental", lat: 1, lon: 1, rating: 4.5, reviews: 30, complaints: [{ type: "telefono", quote: "no cogen" }], source: "Google", sourceUrl: "https://maps.google.com/?cid=1" };
+  await worker.fetch(new Request("https://app.test/api/crm/save", { method: "POST", headers: { cookie, origin: "https://app.test" }, body: JSON.stringify({ company: g }) }), envC, ctx);
+  const row = (await d1.prepare("SELECT company_json FROM leads").first()) as any;
+  const stored = JSON.parse(row.company_json);
+  assert.equal(stored.rating, undefined);
+  assert.equal(stored.complaints, undefined);
+});

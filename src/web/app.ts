@@ -1,6 +1,7 @@
 // Frontend de OpportunityOS (sin framework). Todo dato externo pasa por esc() antes de pintarse.
 
 import type { Analysis, Company, GeoArea, Opportunity, OpportunityScore, Signal } from "../core/types.js";
+import { OUTCOMES, STATUSES, OPEN_STATUSES, statusLabel, strengths, suggestNextAction, type Activity, type Lead } from "../core/crm.js";
 
 
 interface SearchResult {
@@ -139,6 +140,8 @@ const state = {
   quick: "all" as QuickFilter,
   shown: 60,
   chat: [] as Array<{ role: "user" | "assistant"; content: string }>,
+  leads: new Map<string, Lead>(),
+  leadsLoaded: false,
   chatBusy: false,
 };
 
@@ -225,6 +228,12 @@ function route() {
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.removeAttribute("aria-current"));
   if (h.startsWith("#/empresa/")) {
     renderProfile(decodeURIComponent(h.slice("#/empresa/".length)));
+  } else if (h.startsWith("#/hoy")) {
+    $("[data-nav=today]")?.setAttribute("aria-current", "page");
+    renderToday();
+  } else if (h.startsWith("#/pipeline")) {
+    $("[data-nav=pipeline]")?.setAttribute("aria-current", "page");
+    renderPipeline();
   } else if (h.startsWith("#/ajustes")) {
     $("[data-nav=settings]")?.setAttribute("aria-current", "page");
     renderSettings();
@@ -483,6 +492,7 @@ function cardHtml(r: SearchResult): string {
     <div class="actions">
       ${c.website && !cur.analyzed ? `<button class="btn btn-sm btn-primary" data-analyze="${esc(c.id)}" type="button">Analizar oportunidad</button>` : ""}
       <a class="btn btn-sm" href="#/empresa/${encodeURIComponent(c.id)}">Ver perfil</a>
+      ${state.leads.has(c.id) ? `<a class="btn btn-sm btn-ghost" href="#/empresa/${encodeURIComponent(c.id)}">${statusPill(state.leads.get(c.id)!.status)}</a>` : `<button class="btn btn-sm" type="button" data-save="${esc(c.id)}" title="Guardar en tu pipeline para hacer seguimiento">＋ Pipeline</button>`}
       ${c.website ? `<a class="btn btn-sm btn-ghost" href="${safeHref(c.website)}" target="_blank" rel="noopener noreferrer">${esc(hostOf(c.website))} ↗</a>` : ""}
       ${c.googleMapsUri ? `<a class="btn btn-sm btn-ghost" href="${safeHref(c.googleMapsUri)}" target="_blank" rel="noopener noreferrer">Google Maps ↗</a>` : ""}
     </div>
@@ -499,6 +509,16 @@ function renderCards() {
     state.shown += 60;
     renderCards();
   });
+  el.querySelectorAll<HTMLButtonElement>("[data-save]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const r = state.data?.results.find((x) => x.company.id === b.dataset.save);
+      if (!r) return;
+      b.disabled = true;
+      b.textContent = "Guardando…";
+      if (await saveLead(r, "contactar", state.data?.parsed.raw ?? "")) renderCards();
+      else b.disabled = false;
+    }),
+  );
   el.querySelectorAll<HTMLButtonElement>("[data-analyze]").forEach((b) => b.addEventListener("click", () => analyzeOne(b.dataset.analyze!, b)));
   el.querySelectorAll<HTMLElement>(".card").forEach((card) =>
     card.addEventListener("mouseenter", () => {
@@ -849,15 +869,21 @@ function findCompany(id: string): SearchResult | undefined {
 async function renderProfile(id: string) {
   destroyMap();
   const app = $("#app")!;
-  const r = findCompany(id);
+  let r = findCompany(id);
   if (!r) {
-    app.innerHTML = `<section class="view"><a class="back" href="#/">← Explorar mercado</a><div class="empty">Esta empresa no está en la búsqueda actual. Vuelve a buscar para abrir su perfil.</div></section>`;
+    app.innerHTML = `<section class="view"><div class="skeleton"></div></section>`;
+    r = await resultFromLead(id);
+  }
+  if (!r) {
+    app.innerHTML = `<section class="view"><a class="back" href="#/">← Explorar mercado</a><div class="empty">Esta empresa no está en la búsqueda actual ni en tu pipeline. Vuelve a buscar para abrir su perfil.</div></section>`;
     return;
   }
   const c = r.company;
   let analysis = state.analyses.get(id);
-  app.innerHTML = `<section class="view"><a class="back" href="#/">← Volver a resultados</a><div id="profile">${profileHtml(c, analysis ?? null, r)}</div></section>`;
+  app.innerHTML = `<section class="view"><a class="back" href="#/" data-back>← Volver</a><div id="profile">${profileHtml(c, analysis ?? null, r)}</div></section>`;
   bindProfile(c);
+  bindBack(app);
+  loadLeadPanel(c, r);
   if (!analysis) {
     try {
       analysis = (await api<{ analysis: Analysis }>("/api/analyze", { company: c })).analysis;
@@ -865,11 +891,26 @@ async function renderProfile(id: string) {
       if (location.hash === `#/empresa/${encodeURIComponent(id)}`) {
         $("#profile")!.innerHTML = profileHtml(c, analysis, r);
         bindProfile(c);
+        loadLeadPanel(c, r);
       }
     } catch (e) {
       $("#analysis-status")!.innerHTML = errorBox(e as ApiError);
     }
   }
+}
+
+function nextActionHtml(c: Company, ops: Opportunity[]): string {
+  const lead = state.leads.get(c.id);
+  const na = suggestNextAction(c, ops, lead?.status ?? "nueva");
+  const btn =
+    na.channel === "llamada" && c.phone
+      ? `<a class="btn btn-primary btn-sm" href="tel:${esc(c.phone.replace(/\s/g, ""))}">Llamar · ${esc(c.phone)}</a><button class="btn btn-sm" type="button" data-gen="llamada">Ver guion</button>`
+      : na.channel === "email"
+        ? `<button class="btn btn-primary btn-sm" type="button" data-gen="email">Preparar email</button>`
+        : na.channel === "instagram" && c.instagram
+          ? `<a class="btn btn-primary btn-sm" href="${safeHref(c.instagram)}" target="_blank" rel="noopener noreferrer">Abrir Instagram</a><button class="btn btn-sm" type="button" data-gen="whatsapp">Preparar mensaje</button>`
+          : "";
+  return `<div class="next-action"><div class="na-icon" aria-hidden="true">🎯</div><div class="na-body"><span class="eyebrow">Siguiente acción</span><strong>${esc(na.action)}</strong><p>${esc(na.reason)}</p></div><div class="na-btns">${btn}</div></div>`;
 }
 
 function signalRow(s: Signal): string {
@@ -928,12 +969,19 @@ function profileHtml(c: Company, a: Analysis | null, r: SearchResult): string {
       <div class="muted">${[c.address, c.postcode, c.city].filter(Boolean).map(esc).join(" · ") || "Dirección no disponible"}</div>
       <div class="recommend">Solución recomendada: <b>${esc(recommended)}</b></div>
     </div>
-    <div style="display:flex;align-items:center;gap:14px">${score.partial ? `<span class="badge partial">Provisional</span>` : ""}${scoreRing(score.score, true)}</div>
+    <div class="score-box">${scoreRing(score.score, true)}<div class="sb-text"><strong>${score.score}/100</strong><span>Potencial comercial</span>${score.partial ? `<span class="badge partial">Provisional</span>` : ""}</div></div>
   </div>
   ${loadingNote}
+  ${nextActionHtml(c, a?.opportunities ?? r.opportunities)}
   <div class="grid-2">
     <div>
-      <div class="panel"><h2>Por qué este score</h2><div class="dims">${dims}</div><ul class="reason-list">${reasons}</ul></div>
+      <div class="panel"><h2>Por qué este score</h2><div class="dims">${dims}</div><ul class="reason-list">${reasons}</ul>${
+        a && strengths(a.signals).length
+          ? `<h3 class="sub">Por qué no es 100 · lo que ya hace bien</h3><ul class="strengths">${strengths(a.signals)
+              .map((x) => `<li>${esc(x)}</li>`)
+              .join("")}</ul>`
+          : ""
+      }</div>
       <div class="panel"><h2>Oportunidades detectadas</h2><div class="opps">${opps || `<p class="muted">Sin oportunidades claras con los datos disponibles.</p>`}</div></div>
       <div class="panel" id="gen-panel"><h2>Acción comercial</h2>
         <p class="muted" style="margin:0 0 10px;font-size:13px">Elige qué quieres preparar y la IA lo escribe con los datos reales de este negocio, firmado por <b>${esc(loadSettings().senderName)}</b> de <b>${esc(loadSettings().agencyName)}</b>. Puedes editar el texto antes de copiarlo o enviarlo.</p>
@@ -950,6 +998,7 @@ function profileHtml(c: Company, a: Analysis | null, r: SearchResult): string {
       </div>
     </div>
     <div>
+      <div class="panel lead-panel" id="lead-panel"><h2>Mi pipeline</h2><div class="skeleton" style="height:60px"></div></div>
       <div class="panel"><h2>Información</h2><dl class="kv">
         <dt>Teléfono</dt><dd>${c.phone ? `<a href="tel:${esc(c.phone.replace(/\s/g, ""))}">${esc(c.phone)}</a>` : "No publicado"}</dd>
         <dt>Web</dt><dd>${c.website ? `<a href="${safeHref(c.website)}" target="_blank" rel="noopener noreferrer">${esc(hostOf(c.website))}</a>` : "No encontrada"}</dd>
@@ -1049,7 +1098,17 @@ function bindProfile(c: Company) {
     }),
   );
   $("#gen-btn")?.addEventListener("click", generate);
+  document.querySelectorAll<HTMLButtonElement>("[data-gen]").forEach((b) =>
+    b.addEventListener("click", () => {
+      document.querySelector<HTMLButtonElement>(`#gen-panel .tab[data-kind="${b.dataset.gen}"]`)?.click();
+      if (!out().value.trim()) generate();
+      $("#gen-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }),
+  );
   $("#gen-out")?.addEventListener("input", paintActions);
+  $("#send-wa")?.addEventListener("click", () => logIfLead(c.id, "whatsapp", "WhatsApp enviado (preparado con IA)"));
+  $("#send-mail")?.addEventListener("click", () => logIfLead(c.id, "email", "Email enviado (preparado con IA)"));
+  $("#send-call")?.addEventListener("click", () => logIfLead(c.id, "llamada", "Llamada iniciada desde la app"));
   $("#copy-btn")?.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(out().value);
@@ -1079,6 +1138,280 @@ function bindProfile(c: Company) {
       btn.disabled = false;
     }
   });
+}
+
+// ---------- Pipeline (CRM) ----------
+
+const euro = (n: number) => `${Math.round(n).toLocaleString("es-ES")} €`;
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const fmtDate = (d?: string | null) => {
+  if (!d) return "—";
+  const t = todayStr();
+  if (d === t) return "Hoy";
+  const diff = Math.round((Date.parse(d) - Date.parse(t)) / 86400000);
+  if (diff === 1) return "Mañana";
+  if (diff === -1) return "Ayer";
+  if (diff < 0) return `Hace ${-diff} días`;
+  if (diff < 7) return `En ${diff} días`;
+  return new Date(d + "T12:00:00").toLocaleDateString("es-ES", { day: "numeric", month: "short" });
+};
+const statusPill = (id: string) => {
+  const st = STATUSES.find((x) => x.id === id);
+  return `<span class="pill" style="--pc:${st?.color ?? "#888"}">${esc(statusLabel(id))}</span>`;
+};
+
+async function loadLeads(force = false): Promise<void> {
+  if (state.leadsLoaded && !force) return;
+  try {
+    const { leads } = await api<{ leads: Lead[] }>("/api/crm/leads");
+    state.leads = new Map(leads.map((l) => [l.id, l]));
+    state.leadsLoaded = true;
+  } catch {}
+}
+
+async function logIfLead(id: string, kind: Activity["kind"], note: string) {
+  if (!state.leads.has(id)) return;
+  try {
+    await api("/api/crm/update", { id, kind, note, status: state.leads.get(id)!.status === "nueva" || state.leads.get(id)!.status === "contactar" ? "contactada" : undefined });
+    await loadLeads(true);
+  } catch {}
+}
+
+async function saveLead(r: SearchResult, status = "nueva", from = ""): Promise<boolean> {
+  const cur = currentResult(r);
+  const na = suggestNextAction(r.company, cur.opportunities, status);
+  try {
+    await api("/api/crm/save", {
+      company: r.company,
+      status,
+      score: cur.score.score,
+      solution: cur.recommended,
+      system: systemOf(r),
+      nextAction: na.action,
+      nextDate: todayStr(),
+      from,
+    });
+    await loadLeads(true);
+    return true;
+  } catch (e) {
+    alert((e as Error).message);
+    return false;
+  }
+}
+
+/** Abre un negocio guardado en el pipeline aunque no esté en la búsqueda actual. */
+async function resultFromLead(id: string): Promise<SearchResult | undefined> {
+  try {
+    const { lead } = await api<{ lead: Lead | null }>(`/api/crm/lead?id=${encodeURIComponent(id)}`);
+    if (!lead?.company_json) return undefined;
+    const company = JSON.parse(lead.company_json) as Company;
+    const { analysis } = await api<{ analysis: Analysis }>("/api/analyze", { company });
+    state.analyses.set(id, analysis);
+    return { company, score: analysis.score, recommended: analysis.recommended, opportunities: analysis.opportunities, system: analysis.opportunities.find((o) => o.system)?.title ?? null };
+  } catch {
+    return undefined;
+  }
+}
+
+function bindBack(root: ParentNode) {
+  root.querySelector<HTMLAnchorElement>("[data-back]")?.addEventListener("click", (e) => {
+    if (history.length > 1) {
+      e.preventDefault();
+      history.back();
+    }
+  });
+}
+
+async function loadLeadPanel(c: Company, r: SearchResult) {
+  const el = $("#lead-panel");
+  if (!el) return;
+  await loadLeads();
+  const lead = state.leads.get(c.id);
+  if (!lead) {
+    el.innerHTML = `<h2>Mi pipeline</h2><p class="muted" style="margin:0 0 12px">Guárdalo para apuntar llamadas, notas, valor y la fecha del próximo seguimiento.</p><button class="btn btn-primary" type="button" id="lead-add">＋ Añadir a mi pipeline</button>`;
+    $("#lead-add")!.addEventListener("click", async () => {
+      ($("#lead-add") as HTMLButtonElement).disabled = true;
+      if (await saveLead(r, "contactar", "perfil")) loadLeadPanel(c, r);
+    });
+    return;
+  }
+  let acts: Activity[] = [];
+  try {
+    acts = (await api<{ activities: Activity[] }>(`/api/crm/lead?id=${encodeURIComponent(c.id)}`)).activities;
+  } catch {}
+  const overdue = lead.next_date && lead.next_date < todayStr() && OPEN_STATUSES.includes(lead.status as any);
+  el.innerHTML = `<h2>Mi pipeline ${statusPill(lead.status)}</h2>
+    <div class="lead-grid">
+      <label class="field"><span>Estado</span><select id="lead-status">${STATUSES.map((st) => `<option value="${st.id}"${st.id === lead.status ? " selected" : ""}>${st.label}</option>`).join("")}</select></label>
+      <label class="field"><span>Valor estimado (€)</span><input id="lead-value" type="number" min="0" step="50" value="${lead.value_eur ?? ""}" placeholder="Ej. 900"></label>
+      <label class="field"><span>Próximo seguimiento</span><input id="lead-date" type="date" value="${lead.next_date ?? ""}"></label>
+      <label class="field"><span>Qué hacer</span><input id="lead-next" maxlength="200" value="${esc(lead.next_action ?? "")}" placeholder="Volver a llamar"></label>
+    </div>
+    ${overdue ? `<p class="warn-line" style="margin:8px 0 0">Seguimiento atrasado (${esc(fmtDate(lead.next_date))}).</p>` : ""}
+    <div class="outcomes"><span class="muted">Resultado del contacto:</span>${OUTCOMES.map((o) => `<button type="button" class="chip" data-outcome="${o.id}">${esc(o.label)}</button>`).join("")}</div>
+    <div class="note-box"><textarea id="lead-note" rows="2" maxlength="2000" placeholder="Nota: qué te ha dicho, con quién has hablado…"></textarea><button class="btn btn-sm" type="button" id="lead-note-btn">Añadir nota</button></div>
+    <ol class="timeline">${acts.map((a) => `<li><span class="tl-k">${esc(a.kind)}</span><div>${esc(a.text ?? "")}${a.to_status ? ` → ${statusPill(a.to_status)}` : ""}<small>${new Date(a.at).toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</small></div></li>`).join("") || `<li class="muted">Sin actividad todavía.</li>`}</ol>
+    <button class="btn btn-sm btn-ghost danger" type="button" id="lead-del">Quitar del pipeline</button>`;
+  const update = async (payload: Record<string, unknown>) => {
+    try {
+      await api("/api/crm/update", { id: c.id, ...payload });
+      await loadLeads(true);
+      loadLeadPanel(c, r);
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  };
+  $("#lead-status")!.addEventListener("change", (e) => update({ status: (e.target as HTMLSelectElement).value }));
+  $("#lead-value")!.addEventListener("change", (e) => {
+    const v = (e.target as HTMLInputElement).value;
+    update({ valueEur: v === "" ? null : Number(v) });
+  });
+  $("#lead-date")!.addEventListener("change", (e) => update({ nextDate: (e.target as HTMLInputElement).value || null }));
+  $("#lead-next")!.addEventListener("change", (e) => update({ nextAction: (e.target as HTMLInputElement).value || null }));
+  $("#lead-note-btn")!.addEventListener("click", () => {
+    const v = ($("#lead-note") as HTMLTextAreaElement).value.trim();
+    if (v) update({ note: v, kind: "nota" });
+  });
+  el.querySelectorAll<HTMLButtonElement>("[data-outcome]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const o = OUTCOMES.find((x) => x.id === b.dataset.outcome)!;
+      const extra = ($("#lead-note") as HTMLTextAreaElement).value.trim();
+      update({ status: o.status, kind: o.kind, note: extra ? `${o.note}. ${extra}` : o.note, ...(o.days === null ? { nextDate: null, nextAction: null } : { addDays: o.days, nextAction: o.next }) });
+    }),
+  );
+  $("#lead-del")!.addEventListener("click", async () => {
+    if (!confirm(`¿Quitar «${c.name}» del pipeline? Se borran sus notas.`)) return;
+    await api("/api/crm/delete", { id: c.id });
+    await loadLeads(true);
+    loadLeadPanel(c, r);
+  });
+}
+
+// ---------- Hoy ----------
+
+interface Summary {
+  today: string;
+  total: number;
+  byStatus: Record<string, { n: number; v: number }>;
+  pipelineValue: number;
+  wonValue: number;
+  contacted: number;
+  won: number;
+  conversion: number;
+  due: Lead[];
+  recent: Lead[];
+  activity: Array<{ at: string; kind: string; text?: string; to_status?: string; name: string; lead_id: string }>;
+}
+
+async function renderToday() {
+  destroyMap();
+  const app = $("#app")!;
+  const st = loadSettings();
+  const hour = new Date().getHours();
+  const hello = hour < 13 ? "Buenos días" : hour < 21 ? "Buenas tardes" : "Buenas noches";
+  app.innerHTML = `<section class="view"><div class="eyebrow">Hoy · ${new Date().toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" })}</div><h1 class="hero">${hello}, ${esc(st.senderName)}</h1><div id="today"><div class="skeleton"></div></div></section>`;
+  let sm: Summary;
+  try {
+    sm = await api<Summary>(`/api/crm/summary?today=${todayStr()}`);
+  } catch (e) {
+    $("#today")!.innerHTML = errorBox(e as ApiError);
+    return;
+  }
+  const overdue = sm.due.filter((l) => (l.next_date ?? "") < sm.today);
+  const dueToday = sm.due.filter((l) => l.next_date === sm.today);
+  const open = OPEN_STATUSES.reduce((a, k) => a + (sm.byStatus[k]?.n ?? 0), 0);
+  const kpi = (n: string, l: string, hint = "") => `<div class="kpi"><span class="kpi-n">${n}</span><span class="kpi-l">${l}</span>${hint ? `<small>${hint}</small>` : ""}</div>`;
+  const dueRow = (l: Lead) => `<li class="due-row">
+      <a class="due-main" href="#/empresa/${encodeURIComponent(l.id)}"><strong>${esc(l.name)}</strong><span>${esc([l.sector_label, l.city].filter(Boolean).join(" · "))}</span><em>${esc(l.next_action ?? "Seguimiento")}${l.system ? ` · falta ${esc(l.system.toLowerCase())}` : ""}</em></a>
+      <span class="due-when${(l.next_date ?? "") < sm.today ? " late" : ""}">${esc(fmtDate(l.next_date))}</span>
+      ${statusPill(l.status)}
+      ${l.phone ? `<a class="btn btn-sm btn-primary" href="tel:${esc(l.phone.replace(/\s/g, ""))}">Llamar</a>` : `<a class="btn btn-sm" href="#/empresa/${encodeURIComponent(l.id)}">Abrir</a>`}
+    </li>`;
+  const funnel = STATUSES.filter((x) => x.id !== "no_interesado")
+    .map((x) => {
+      const n = sm.byStatus[x.id]?.n ?? 0;
+      const max = Math.max(1, ...STATUSES.map((y) => sm.byStatus[y.id]?.n ?? 0));
+      return `<a class="fun-row" href="#/pipeline?status=${x.id}"><span>${x.label}</span><div class="fun-bar"><div style="width:${(n / max) * 100}%;background:${x.color}"></div></div><b>${n}</b></a>`;
+    })
+    .join("");
+  $("#today")!.innerHTML = sm.total
+    ? `<div class="kpis">
+        ${kpi(String(dueToday.length + overdue.length), "Seguimientos para hoy", overdue.length ? `${overdue.length} atrasados` : "al día")}
+        ${kpi(String(open), "En el pipeline", `${sm.total} en total`)}
+        ${kpi(euro(sm.pipelineValue), "Valor en juego", "suma de los abiertos")}
+        ${kpi(String(sm.won), "Clientes ganados", sm.wonValue ? euro(sm.wonValue) : "")}
+        ${kpi(`${sm.conversion}%`, "Conversión", `${sm.contacted} contactados`)}
+      </div>
+      <div class="today-grid">
+        <div class="panel"><h2>Para hoy</h2>${sm.due.length ? `<ul class="due-list">${[...overdue, ...dueToday].map(dueRow).join("")}</ul>` : `<p class="muted">No tienes seguimientos pendientes para hoy. Buen momento para <a href="#/">buscar nuevos negocios</a>.</p>`}</div>
+        <div>
+          <div class="panel"><h2>Embudo</h2><div class="funnel">${funnel}</div></div>
+          <div class="panel"><h2>Últimos movimientos</h2><ul class="act-list">${sm.activity.map((a) => `<li><a href="#/empresa/${encodeURIComponent(a.lead_id)}">${esc(a.name)}</a> <span class="muted">· ${esc(a.text ?? "")}</span><small>${new Date(a.at).toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</small></li>`).join("") || `<li class="muted">Nada todavía.</li>`}</ul></div>
+        </div>
+      </div>`
+    : `<div class="onboard panel">
+        <h2>Empieza tu pipeline</h2>
+        <p>Busca negocios en <b>Explorar mercado</b> y pulsa <b>＋ Pipeline</b> en los que quieras contactar. Aquí verás cada día a quién llamar, los seguimientos atrasados, el valor de lo que tienes en juego y tu conversión.</p>
+        <div class="onboard-steps"><span>1 · Encuentra</span><span>2 · Guarda</span><span>3 · Contacta</span><span>4 · Haz seguimiento</span><span>5 · Cierra</span></div>
+        <a class="btn btn-primary" href="#/">Buscar negocios</a>
+      </div>`;
+}
+
+// ---------- Pipeline ----------
+
+async function renderPipeline() {
+  destroyMap();
+  const app = $("#app")!;
+  const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
+  let filter = params.get("status") ?? "abiertos";
+  app.innerHTML = `<section class="view"><div class="eyebrow">Pipeline</div><h1 class="hero">Tus oportunidades</h1><div id="pl"><div class="skeleton"></div></div></section>`;
+  await loadLeads(true);
+  const all = [...state.leads.values()];
+  let q = "";
+  const paint = () => {
+    const list = all
+      .filter((l) => (filter === "abiertos" ? OPEN_STATUSES.includes(l.status as any) : filter === "todos" ? true : l.status === filter))
+      .filter((l) => !q || `${l.name} ${l.city ?? ""} ${l.sector_label ?? ""}`.toLowerCase().includes(q))
+      .sort((a, b) => (a.next_date ?? "9999").localeCompare(b.next_date ?? "9999") || (b.score ?? 0) - (a.score ?? 0));
+    const tab = (id: string, label: string, n: number) => `<button type="button" class="ptab${filter === id ? " is-on" : ""}" data-f="${id}">${label} <b>${n}</b></button>`;
+    $("#pl")!.innerHTML = all.length
+      ? `<div class="ptabs">${tab("abiertos", "Abiertos", all.filter((l) => OPEN_STATUSES.includes(l.status as any)).length)}${STATUSES.map((x) => tab(x.id, x.label, all.filter((l) => l.status === x.id).length)).join("")}${tab("todos", "Todos", all.length)}</div>
+        <div class="pl-tools"><input id="pl-q" placeholder="Buscar por nombre, ciudad o sector…" value="${esc(q)}"><span class="muted">${list.length} negocios · ${euro(list.reduce((a, l) => a + (l.value_eur ?? 0), 0))}</span></div>
+        <div class="pl-table" role="table">
+          <div class="pl-head" role="row"><span>Negocio</span><span>Estado</span><span>Siguiente paso</span><span>Valor</span><span>Score</span></div>
+          ${list
+            .map(
+              (l) => `<a class="pl-row" role="row" href="#/empresa/${encodeURIComponent(l.id)}">
+            <span><strong>${esc(l.name)}</strong><small>${esc([l.sector_label, l.city].filter(Boolean).join(" · "))}${l.system ? ` · <i>falta ${esc(l.system.toLowerCase())}</i>` : ""}</small></span>
+            <span>${statusPill(l.status)}</span>
+            <span><span class="due-when${l.next_date && l.next_date < todayStr() && OPEN_STATUSES.includes(l.status as any) ? " late" : ""}">${esc(fmtDate(l.next_date))}</span><small>${esc(l.next_action ?? "")}</small></span>
+            <span class="mono">${l.value_eur ? euro(l.value_eur) : "—"}</span>
+            <span class="mono">${l.score ?? "—"}</span>
+          </a>`,
+            )
+            .join("") || `<div class="empty">Nada en este estado.</div>`}
+        </div>`
+      : `<div class="onboard panel"><h2>Tu pipeline está vacío</h2><p>En los resultados de búsqueda pulsa <b>＋ Pipeline</b> en los negocios que quieras contactar.</p><a class="btn btn-primary" href="#/">Buscar negocios</a></div>`;
+    $("#pl")!.querySelectorAll<HTMLButtonElement>("[data-f]").forEach((b) =>
+      b.addEventListener("click", () => {
+        filter = b.dataset.f!;
+        paint();
+      }),
+    );
+    const qi = $("#pl-q") as HTMLInputElement | null;
+    qi?.addEventListener("input", () => {
+      q = qi.value.toLowerCase().trim();
+      const pos = qi.selectionStart;
+      paint();
+      const n = $("#pl-q") as HTMLInputElement;
+      n.focus();
+      n.setSelectionRange(pos, pos);
+    });
+  };
+  paint();
 }
 
 // ---------- Ajustes ----------
@@ -1354,4 +1687,8 @@ initAssistant();
 window.addEventListener("hashchange", route);
 // La configuración (clave del mapa, contacto) se pide en paralelo: la interfaz no espera por ella
 ensureConfig();
+loadLeads().then(() => {
+  if ($("#results")) renderCards();
+});
+if (!location.hash) history.replaceState(null, "", "#/hoy");
 route();

@@ -12,6 +12,7 @@ import { assistantSystem, buildGenerationPrompt, createProvider, estimateCostUsd
 import { ExternalError } from "../core/http.js";
 import { resolveSector } from "../core/sectors.js";
 import type { Analysis, Company, GeoArea, WebAudit } from "../core/types.js";
+import { handleCrm, type D1Like } from "./crm.js";
 import { clearSessionCookie, createSessionCookie, hasValidSession, passwordMatches, RateLimiter, withSecurityHeaders } from "./security.js";
 
 export interface Env {
@@ -34,6 +35,8 @@ export interface Env {
   GOOGLE_MAPS_BROWSER_KEY?: string;
   /** Firma por defecto de los textos */
   AGENCY_NAME?: string;
+  /** Base de datos D1 del pipeline (CRM) */
+  DB?: D1Like;
   /** KV con los interruptores de administrador */
   SETTINGS?: { get(key: string): Promise<string | null>; put(key: string, value: string): Promise<void> };
   /** Solo para tests: permite inyectar proveedores */
@@ -447,6 +450,18 @@ export async function handle(req: Request, env: Env, ctx: Ctx): Promise<Response
     if (!authed) return fail(401, "Sesión caducada. Vuelve a entrar.");
     if (!apiLimiter.allow(`api:${ip}`)) return fail(429, "Demasiadas peticiones. Espera un minuto.");
     if (req.method === "GET" && url.pathname === "/api/config") return await handleConfig(env);
+    if (url.pathname.startsWith("/api/crm/")) {
+      const origin = req.headers.get("origin");
+      if (req.method === "POST" && origin && origin !== url.origin) return fail(403, "Origen no permitido.");
+      try {
+        const body = req.method === "POST" ? await readJson(req) : {};
+        return await handleCrm(req, env.DB, url.pathname, body, validateCompany);
+      } catch (e) {
+        if (e instanceof ExternalError) return fail(e.status ?? 400, e.message);
+        console.error(JSON.stringify({ level: "error", path: url.pathname, message: (e as Error).message }));
+        return fail(500, "Error en el pipeline. Revisa los logs del Worker.");
+      }
+    }
     if (req.method !== "POST") return fail(405, "Método no permitido.");
     // Protección CSRF: las llamadas de la API deben venir de nuestro propio origen.
     const origin = req.headers.get("origin");
