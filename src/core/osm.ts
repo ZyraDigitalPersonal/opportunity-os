@@ -119,7 +119,7 @@ export class OsmProvider implements DataProvider {
   }
 
   /** Ejecuta la consulta probando servidores hasta que uno responda bien. */
-  private async runOverpass(query: string): Promise<OverpassElement[]> {
+  async runOverpass(query: string): Promise<OverpassElement[]> {
     const errors: string[] = [];
     for (const [i, url] of this.overpass.entries()) {
       try {

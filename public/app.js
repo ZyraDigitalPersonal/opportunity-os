@@ -1,5 +1,7 @@
 // Frontend de OpportunityOS (sin framework). Todo dato externo pasa por esc() antes de pintarse.
 import { OUTCOMES, STATUSES, OPEN_STATUSES, statusLabel, strengths, suggestNextAction } from "../core/crm.js";
+import { $, api, bindReviews, confidenceBadge, csvDownload, errorBox, esc, fmtDate, hostOf, reviewHtml, safeHref, scoreRing, storage, todayStr } from "./util.js";
+import { practicasScreenContext, renderPracticas } from "./practicas.js";
 /** Servicios que puede vender la agencia → ids de oportunidad del motor */
 const SERVICES = [
     ["web", "Páginas web", ["new_web", "fix_web", "redesign"]],
@@ -92,56 +94,6 @@ const state = {
     chatBusy: false,
 };
 // ---------- Utilidades ----------
-const $ = (sel, root = document) => root.querySelector(sel);
-function esc(v) {
-    return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-}
-function safeHref(u) {
-    if (!u)
-        return "#";
-    return /^https?:\/\//i.test(u) ? esc(u) : "#";
-}
-function storage() {
-    try {
-        return window.sessionStorage;
-    }
-    catch {
-        return null;
-    }
-}
-function scoreColor(v) {
-    return v >= 70 ? "var(--high)" : v >= 45 ? "var(--mid)" : "var(--low)";
-}
-function scoreRing(v, lg = false) {
-    return `<div class="score${lg ? " lg" : ""}" style="--v:${v};--c:${scoreColor(v)}" role="img" aria-label="Opportunity Score ${v} de 100"><span>${v}</span></div>`;
-}
-function hostOf(u) {
-    try {
-        return u ? new URL(u).hostname.replace(/^www\./, "") : "";
-    }
-    catch {
-        return u ?? "";
-    }
-}
-async function api(path, body) {
-    const res = await fetch(path, body === undefined ? { credentials: "same-origin" } : { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    if (res.status === 401) {
-        location.href = "/login";
-        throw new Error("Sesión caducada");
-    }
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-        const err = new Error(data.error ?? `Error ${res.status}`);
-        err.status = res.status;
-        err.missing = data.missing;
-        throw err;
-    }
-    return data;
-}
-function errorBox(e) {
-    const cfg = e.missing ? `<p>Configura la variable <code>${esc(e.missing)}</code> en Cloudflare (Workers → tu worker → Settings → Variables and Secrets).</p>` : "";
-    return `<div class="error-box" role="alert"><strong>${esc(e.message)}</strong>${cfg}</div>`;
-}
 // ---------- Tema ----------
 function initTheme() {
     let saved = null;
@@ -180,6 +132,11 @@ function route() {
     else if (h.startsWith("#/pipeline")) {
         $("[data-nav=pipeline]")?.setAttribute("aria-current", "page");
         renderPipeline();
+    }
+    else if (h.startsWith("#/practicas")) {
+        $("[data-nav=practicas]")?.setAttribute("aria-current", "page");
+        destroyMap();
+        renderPracticas(h);
     }
     else if (h.startsWith("#/ajustes")) {
         $("[data-nav=settings]")?.setAttribute("aria-current", "page");
@@ -415,17 +372,22 @@ function presenceBadges(c) {
     const stars = c.rating !== undefined ? `<span class="badge on" title="Google Maps">${c.rating.toFixed(1)} ★ · ${c.reviews ?? 0}</span>` : "";
     return `<div class="presence">${b(!!c.website, "Web")}${b(!!c.phone, "Teléfono")}${b(!!(c.instagram || c.facebook), "Redes")}${b(!!c.openingHours, "Horario")}${c.whatsapp ? b(true, "WhatsApp") : ""}${stars}</div>`;
 }
+const SCORE_DEFINITION_FALLBACK = "Opportunity Score (0-100): margen de mejora digital según las señales detectadas, más lo contactable que es el negocio y el encaje de su sector. No es una probabilidad de venta.";
+const COMPLAINT_TITLE = { telefono: "Queja: no cogen el teléfono", esperas: "Queja: esperas o citas", atencion: "Queja: atención o mensajes sin respuesta" };
+/** Queja detectada: reseña completa (plegada si es larga) con la frase resaltada y enlace a Google. */
+function complaintHtml(k) {
+    const head = `<div class="complaint-head">${esc(COMPLAINT_TITLE[k.type])} <small>· reseña de Google</small></div>`;
+    if (!k.text)
+        return `<div class="complaint">${head}<p>«${esc(k.quote)}»</p></div>`;
+    return `<div class="complaint">${head}${reviewHtml({ text: k.text, rating: k.rating, author: k.author, when: k.when, uri: k.uri }, { highlight: k.quote })}</div>`;
+}
 function cardHtml(r) {
     const c = r.company;
     const cur = currentResult(r);
     const reasons = cur.score.items.filter((i) => i.dimension !== "Encaje del sector").slice(0, 2);
     const mine = myOppIds();
     const fit = cur.opportunities.find((o) => mine.has(o.id));
-    const status = cur.analyzed
-        ? `<span class="badge verified">Analizada</span>`
-        : c.website
-            ? `<span class="badge partial" title="El score mejora al revisar la web">Score provisional</span>`
-            : "";
+    const status = (cur.analyzed ? `<span class="badge verified">Web revisada</span>` : c.website ? `<span class="badge partial" title="Tiene web y aún no se ha revisado: pulsa «Analizar oportunidad»">Score provisional</span>` : "") + (cur.score.confidence ? confidenceBadge(cur.score.confidence, cur.score.confidenceReasons) : "");
     return `<article class="card${state.activeId === c.id ? " is-active" : ""}" data-id="${esc(c.id)}">
     <div>
       <h3>${esc(c.name)}</h3>
@@ -433,7 +395,7 @@ function cardHtml(r) {
       <div style="margin:6px 0">${presenceBadges(c)}</div>
       <div class="reco">Solución: <b>${esc(cur.recommended)}</b> ${status}</div>
       <div class="tags">${!c.website ? `<span class="tag tag-hot">Sin web · oportunidad directa</span>` : ""}${systemOf(r) ? `<span class="tag tag-sys">Falta: ${esc(systemOf(r))}</span>` : ""}${c.website && !systemOf(r) && fit ? `<span class="tag">Puedes ofrecer: ${esc(fit.title)}</span>` : ""}</div>
-      ${c.complaints?.length ? `<div class="complaint">«${esc(c.complaints[0].quote.replace(/^…|…$/g, ""))}» <small>— reseña de Google</small></div>` : ""}
+      ${c.complaints?.length ? complaintHtml(c.complaints[0]) : ""}
       <ul class="reasons">${reasons.map((i) => `<li>${esc(i.reason)}</li>`).join("")}</ul>
     </div>
     ${scoreRing(cur.score.score)}
@@ -469,6 +431,7 @@ function renderCards() {
             b.disabled = false;
     }));
     el.querySelectorAll("[data-analyze]").forEach((b) => b.addEventListener("click", () => analyzeOne(b.dataset.analyze, b)));
+    bindReviews(el);
     el.querySelectorAll(".card").forEach((card) => card.addEventListener("mouseenter", () => {
         setActive(card.dataset.id, false);
     }));
@@ -529,23 +492,13 @@ async function batchAnalyze() {
 }
 function exportCsv() {
     const rows = visibleResults();
-    const header = ["Nombre", "Sector", "Dirección", "Ciudad", "CP", "Teléfono", "Web", "Email", "Horario", "Instagram", "Facebook", "Valoración Google", "Reseñas", "Opportunity Score", "Analizada", "Solución recomendada", "Motivos", "Fuente"];
-    const cell = (v) => {
-        const s = String(v ?? "");
-        const safe = /^[=+\-@]/.test(s) ? `'${s}` : s; // evita fórmulas al abrir en Excel
-        return `"${safe.replace(/"/g, '""')}"`;
-    };
+    const header = ["Nombre", "Sector", "Dirección", "Ciudad", "CP", "Teléfono", "Web", "Email", "Horario", "Instagram", "Facebook", "Valoración Google", "Reseñas", "Opportunity Score", "Confianza", "Analizada", "Solución recomendada", "Motivos", "Fuente"];
     const lines = rows.map((r) => {
         const c = r.company;
         const cur = currentResult(r);
-        return [c.name, c.sectorLabel, c.address, c.city, c.postcode, c.phone, c.website, c.email, c.openingHours, c.instagram, c.facebook, c.rating?.toFixed(1), c.reviews, cur.score.score, cur.analyzed ? "sí" : "no", cur.recommended, cur.score.items.map((i) => i.reason).join(" | "), c.sourceUrl].map(cell).join(";");
+        return [c.name, c.sectorLabel, c.address, c.city, c.postcode, c.phone, c.website, c.email, c.openingHours, c.instagram, c.facebook, c.rating?.toFixed(1), c.reviews, cur.score.score, cur.score.confidence ?? "", cur.analyzed ? "sí" : "no", cur.recommended, cur.score.items.map((i) => i.reason).join(" | "), c.sourceUrl];
     });
-    const blob = new Blob(["﻿" + [header.map(cell).join(";"), ...lines].join("\r\n")], { type: "text/csv;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `opportunityos-${(state.data?.area.label ?? "resultados").split(",")[0].toLowerCase().replace(/\s+/g, "-")}.csv`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    csvDownload(`opportunityos-${(state.data?.area.label ?? "resultados").split(",")[0].toLowerCase().replace(/\s+/g, "-")}.csv`, header, lines);
 }
 let googleMapsPromise = null;
 let clustererPromise = null;
@@ -894,17 +847,21 @@ function profileHtml(c, a, r) {
       <div class="muted">${[c.address, c.postcode, c.city].filter(Boolean).map(esc).join(" · ") || "Dirección no disponible"}</div>
       <div class="recommend">Solución recomendada: <b>${esc(recommended)}</b></div>
     </div>
-    <div class="score-box">${scoreRing(score.score, true)}<div class="sb-text"><strong>${score.score}/100</strong><span>Potencial comercial</span>${score.partial ? `<span class="badge partial">Provisional</span>` : ""}</div></div>
+    <div class="score-box">${scoreRing(score.score, true)}<div class="sb-text"><strong>${score.score}/100</strong><span>Opportunity Score</span>${score.partial ? `<span class="badge partial">Provisional</span>` : ""}${score.confidence ? confidenceBadge(score.confidence, score.confidenceReasons) : ""}</div></div>
   </div>
   ${loadingNote}
   ${nextActionHtml(c, a?.opportunities ?? r.opportunities)}
   <div class="grid-2">
     <div>
-      <div class="panel"><h2>Por qué este score</h2><div class="dims">${dims}</div><ul class="reason-list">${reasons}</ul>${a && strengths(a.signals).length
+      <div class="panel"><h2>Por qué este score</h2>
+        <details class="definition"><summary>¿Qué significa este número?</summary><p>${esc(state.data?.meta.scoreDefinition ?? SCORE_DEFINITION_FALLBACK)}</p></details>
+        ${score.confidence ? `<div class="conf-box conf-${score.confidence}"><strong>${esc({ alta: "Confianza alta", media: "Confianza media", baja: "Confianza baja" }[score.confidence])}</strong> · ${Math.round((score.verifiedShare ?? 0) * 100)}% de los puntos salen de hechos verificados<ul>${(score.confidenceReasons ?? []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}
+        <div class="dims">${dims}</div><ul class="reason-list">${reasons}</ul>${a && strengths(a.signals).length
         ? `<h3 class="sub">Por qué no es 100 · lo que ya hace bien</h3><ul class="strengths">${strengths(a.signals)
             .map((x) => `<li>${esc(x)}</li>`)
             .join("")}</ul>`
         : ""}</div>
+      ${c.complaints?.length ? `<div class="panel"><h2>Lo que dicen sus clientes</h2><p class="muted small">Quejas detectadas en las reseñas que Google muestra (como mucho 5, elegidas por Google). Es una muestra, no una estadística.</p>${c.complaints.map(complaintHtml).join("")}</div>` : ""}
       <div class="panel"><h2>Oportunidades detectadas</h2><div class="opps">${opps || `<p class="muted">Sin oportunidades claras con los datos disponibles.</p>`}</div></div>
       <div class="panel" id="gen-panel"><h2>Acción comercial</h2>
         <p class="muted" style="margin:0 0 10px;font-size:13px">Elige qué quieres preparar y la IA lo escribe con los datos reales de este negocio, firmado por <b>${esc(loadSettings().senderName)}</b> de <b>${esc(loadSettings().agencyName)}</b>. Puedes editar el texto antes de copiarlo o enviarlo.</p>
@@ -934,8 +891,8 @@ function profileHtml(c, a, r) {
       </dl></div>
       <div class="panel"><h2>Presencia digital</h2>${auditHtml}</div>
       <div class="panel" id="google-panel"><h2>Ficha de Google</h2>
-        <p class="muted" style="margin:0 0 10px">Valoración, reseñas y horario en vivo. No se guarda (términos de Google). Coste aprox. 0,035 US$ por consulta; las primeras 1.000 al mes son gratis.</p>
-        <button class="btn btn-sm" id="google-btn" type="button">${c.source === "Google" ? "Ver horario y estado en Google" : "Cargar ficha de Google"}</button><div id="google-out"></div>
+        <p class="muted" style="margin:0 0 10px">Valoración, reseñas completas y horario en vivo. No se guarda (términos de Google). Coste aprox. 0,04 US$ por consulta; las primeras 1.000 al mes son gratis.</p>
+        <button class="btn btn-sm" id="google-btn" type="button">${c.source === "Google" ? "Ver reseñas, horario y estado" : "Cargar ficha y reseñas de Google"}</button><div id="google-out"></div>
       </div>
       <div class="panel"><h2>Señales</h2><ul class="signals">${(a?.signals ?? []).map(signalRow).join("") || `<li class="muted">Calculando…</li>`}</ul></div>
     </div>
@@ -954,6 +911,7 @@ function waNumber(phone) {
     return /^\d{9,15}$/.test(d) ? d : null;
 }
 function bindProfile(c) {
+    bindReviews($("#profile") ?? document);
     let kind = "propuesta";
     const texts = new Map();
     const out = () => $("#gen-out");
@@ -1060,7 +1018,8 @@ function bindProfile(c) {
           ${place.phone ? `<dt>Teléfono</dt><dd>${esc(place.phone)}</dd>` : ""}
           ${place.businessStatus && place.businessStatus !== "OPERATIONAL" ? `<dt>Estado</dt><dd>${esc(place.businessStatus)}</dd>` : ""}
           ${place.weekdayHours?.length ? `<dt>Horario</dt><dd>${place.weekdayHours.map(esc).join("<br>")}</dd>` : ""}
-        </dl>${place.googleMapsUri ? `<p><a href="${safeHref(place.googleMapsUri)}" target="_blank" rel="noopener noreferrer">Ver en Google Maps ↗</a></p>` : ""}<div class="google-attr">Datos de Google</div>`;
+        </dl>${place.reviews?.length ? `<h3 class="sub">Reseñas (${place.reviews.length} de ${place.userRatingCount ?? "?"}, elegidas por Google)</h3><div class="reviews">${place.reviews.map((rv) => reviewHtml(rv)).join("")}</div>` : `<p class="muted small">Google no devuelve reseñas con texto para este negocio.</p>`}${place.googleMapsUri ? `<p><a href="${safeHref(place.googleMapsUri)}" target="_blank" rel="noopener noreferrer">Ver todas en Google Maps ↗</a></p>` : ""}<div class="google-attr">Datos de Google</div>`;
+            bindReviews(out);
             btn.hidden = true;
         }
         catch (e) {
@@ -1071,27 +1030,6 @@ function bindProfile(c) {
 }
 // ---------- Pipeline (CRM) ----------
 const euro = (n) => `${Math.round(n).toLocaleString("es-ES")} €`;
-const todayStr = () => {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-};
-const fmtDate = (d) => {
-    if (!d)
-        return "—";
-    const t = todayStr();
-    if (d === t)
-        return "Hoy";
-    const diff = Math.round((Date.parse(d) - Date.parse(t)) / 86400000);
-    if (diff === 1)
-        return "Mañana";
-    if (diff === -1)
-        return "Ayer";
-    if (diff < 0)
-        return `Hace ${-diff} días`;
-    if (diff < 7)
-        return `En ${diff} días`;
-    return new Date(d + "T12:00:00").toLocaleDateString("es-ES", { day: "numeric", month: "short" });
-};
 const statusPill = (id) => {
     const st = STATUSES.find((x) => x.id === id);
     return `<span class="pill" style="--pc:${st?.color ?? "#888"}">${esc(statusLabel(id))}</span>`;
@@ -1414,7 +1352,9 @@ async function renderSettings() {
       ${sw("osm", t.osm, true, "OpenStreetMap · búsqueda", "Datos gratis que completan los de Google (email, redes) y añaden negocios que Google no devuelve.", "")}
       ${sw("ai", t.ai, i.ai, `IA${i.aiProvider ? ` · ${esc(i.aiProvider)}` : ""}`, i.aiFree ? "Asistente y textos comerciales. IA gratuita de Cloudflare con límite diario; con ANTHROPIC_API_KEY usa Claude." : "Asistente y textos comerciales.", "ANTHROPIC_API_KEY")}
       ${sw(null, !!i.contactEmail, !!i.contactEmail, "Email de contacto (opcional)", "Recomendado por la política de uso de OpenStreetMap. Sin él, la búsqueda funciona igual.", "CONTACT_EMAIL")}
-    </ul>${cfg.canToggle ? "" : `<p class="warn-line">Los interruptores se activan al publicar esta versión (falta el almacén de ajustes).</p>`}<p class="muted" style="margin-top:14px;font-size:13px">Las claves se añaden en Cloudflare → Workers → opportunity-os → Settings → Variables and Secrets, siempre como <b>Secreto</b>. Reglas del Opportunity Engine: versión <span class="mono">${esc(cfg.rulesVersion)}</span>.</p>`;
+      ${sw(null, !!cfg.jobFeeds?.adzuna, !!cfg.jobFeeds?.adzuna, "Adzuna · ofertas de prácticas (opcional)", "Ofertas publicadas en España para el módulo de prácticas. Clave gratuita en developer.adzuna.com (250 consultas/día; se cachean 6 h).", "ADZUNA_APP_ID y ADZUNA_APP_KEY")}
+      ${sw(null, !!cfg.jobFeeds?.jooble, !!cfg.jobFeeds?.jooble, "Jooble · ofertas de prácticas (opcional)", "Agregador de ofertas con API gratuita bajo petición (jooble.org/api/about).", "JOOBLE_API_KEY")}
+    </ul>${cfg.mapsKeyIsServerKey ? `<div class="notice" style="margin-top:12px"><b>Seguridad:</b> el mapa está usando la misma clave de Google que el servidor, y esa clave llega al navegador. Crea en Google Cloud una segunda clave solo con «Maps JavaScript API», restringida a <code>${esc(location.host)}</code> (referentes HTTP), y añádela como Secreto <code>GOOGLE_MAPS_BROWSER_KEY</code>. La clave del servidor deja de salir del Worker.</div>` : ""}${cfg.canToggle ? "" : `<p class="warn-line">Los interruptores se activan al publicar esta versión (falta el almacén de ajustes).</p>`}<p class="muted" style="margin-top:14px;font-size:13px">Las claves se añaden en Cloudflare → Workers → opportunity-os → Settings → Variables and Secrets, siempre como <b>Secreto</b>. Reglas del Opportunity Engine: versión <span class="mono">${esc(cfg.rulesVersion)}</span>.</p>`;
         $("#cfg").querySelectorAll("[data-toggle]").forEach((inp) => inp.addEventListener("change", async () => {
             inp.disabled = true;
             try {
@@ -1530,6 +1470,9 @@ function screenContext() {
                 .slice(0, 12)
                 .map((r) => `${r.company.name} (score ${currentResult(r).score.score}${r.company.website ? "" : ", sin web"}${systemOf(r) ? `, falta ${systemOf(r)}` : ""}${r.company.phone ? `, tel ${r.company.phone}` : ""})`)
                 .join("; "));
+    }
+    else if (h.startsWith("#/practicas")) {
+        lines.push(practicasScreenContext());
     }
     else {
         lines.push(`Pantalla: ${h.startsWith("#/ajustes") ? "Ajustes" : h.startsWith("#/ayuda") ? "Ayuda y contacto" : "buscador sin resultados"}.`);

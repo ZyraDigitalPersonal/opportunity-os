@@ -94,8 +94,8 @@ export function analyzeHtml(html: string, finalUrl: string, now = new Date()): O
   };
 }
 
-/** Interpreta robots.txt para nuestro bot (o *). Devuelve true si la raíz "/" está permitida. */
-export function robotsAllowsRoot(robots: string, botName: string): boolean {
+/** Interpreta robots.txt para nuestro bot (o *). Devuelve true si `path` está permitido (regla más específica gana). */
+export function robotsAllowsPath(robots: string, botName: string, path: string): boolean {
   const groups: Array<{ agents: string[]; rules: Array<{ allow: boolean; path: string }> }> = [];
   let current: (typeof groups)[number] | null = null;
   let lastWasAgent = false;
@@ -125,12 +125,16 @@ export function robotsAllowsRoot(robots: string, botName: string): boolean {
   let best: { allow: boolean; len: number } = { allow: true, len: -1 };
   for (const r of group.rules) {
     if (r.path === "") continue; // "Disallow:" vacío = todo permitido
-    const p = r.path.replace(/\*$/, "");
-    if ("/".startsWith(p) || p === "/" || p === "/*") {
-      if (p.length > best.len || (p.length === best.len && r.allow)) best = { allow: r.allow, len: p.length };
-    }
+    const anchored = r.path.endsWith("$");
+    const body = r.path.replace(/\$$/, "");
+    const re = new RegExp("^" + body.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + (anchored ? "$" : ""));
+    if (re.test(path) && (body.length > best.len || (body.length === best.len && r.allow))) best = { allow: r.allow, len: body.length };
   }
   return best.allow;
+}
+
+export function robotsAllowsRoot(robots: string, botName: string): boolean {
+  return robotsAllowsPath(robots, botName, "/");
 }
 
 export interface AuditOptions {

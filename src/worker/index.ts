@@ -5,7 +5,7 @@ import { parseQuery, withAlternative, type ParsedQuery } from "../core/query-par
 import { GooglePlacesSearch, GOOGLE_CALL_USD } from "../core/google-search.js";
 import { mergeCompanies } from "../core/merge.js";
 import { OsmProvider, type DataProvider } from "../core/osm.js";
-import { analyzeCompany, RULES_VERSION, systemGap } from "../core/opportunity-engine.js";
+import { analyzeCompany, RULES_VERSION, SCORE_DEFINITION, systemGap } from "../core/opportunity-engine.js";
 import { auditWebsite } from "../core/web-audit.js";
 import { fetchGooglePlace, GOOGLE_TEXT_SEARCH_USD } from "../core/google-places.js";
 import { assistantSystem, buildGenerationPrompt, createProvider, estimateCostUsd, flattenChat, freeProvider, ZYRA_CONTACT, type ChatMessage, type GenerationKind, type WorkersAIBinding } from "../core/ai.js";
@@ -13,6 +13,7 @@ import { ExternalError } from "../core/http.js";
 import { resolveSector } from "../core/sectors.js";
 import type { Analysis, Company, GeoArea, WebAudit } from "../core/types.js";
 import { handleCrm, type D1Like } from "./crm.js";
+import { handlePracticas } from "./practicas.js";
 import { clearSessionCookie, createSessionCookie, hasValidSession, passwordMatches, RateLimiter, withSecurityHeaders } from "./security.js";
 
 export interface Env {
@@ -39,6 +40,14 @@ export interface Env {
   DB?: D1Like;
   /** KV con los interruptores de administrador */
   SETTINGS?: { get(key: string): Promise<string | null>; put(key: string, value: string): Promise<void> };
+  /** Portales de empleo con API oficial (opcionales) */
+  ADZUNA_APP_ID?: string;
+  ADZUNA_APP_KEY?: string;
+  JOOBLE_API_KEY?: string;
+  /** Plan del propietario (individual | avanzado | centro): fija los límites diarios */
+  PLAN?: string;
+  /** Máximo de llamadas a Google por búsqueda de prácticas (por defecto 6) */
+  PRACTICAS_GOOGLE_MAX_CALLS?: string;
   /** Solo para tests: permite inyectar proveedores */
   __deps?: Partial<Deps>;
 }
@@ -184,7 +193,15 @@ export function validateCompany(v: any): Company | null {
       ? v.complaints
           .filter((k: any) => k && ["telefono", "esperas", "atencion"].includes(k.type) && typeof k.quote === "string")
           .slice(0, 3)
-          .map((k: any) => ({ type: k.type, quote: k.quote.slice(0, 200) }))
+          .map((k: any) => ({
+            type: k.type,
+            quote: k.quote.slice(0, 400),
+            text: str(k.text, 5000),
+            rating: num(k.rating),
+            author: str(k.author, 100),
+            when: str(k.when, 60),
+            uri: typeof k.uri === "string" && /^https:\/\/(www\.)?(google\.[a-z.]+|maps\.google\.com|maps\.app\.goo\.gl)\//.test(k.uri) ? k.uri.slice(0, 400) : undefined,
+          }))
       : undefined,
   };
 }
@@ -263,15 +280,13 @@ async function handleSearch(req: Request, env: Env, ctx: Ctx) {
 
   const companies = google ? mergeCompanies(google.companies, osm) : osm;
 
-  let results = companies.map((c) => {
-    const a = analyzeCompany(c);
-    return { company: c, score: a.score, recommended: a.recommended, opportunities: a.opportunities.slice(0, 6), system: systemGap(a.opportunities) };
-  });
-  if (parsed.filters.withoutWebsite) results = results.filter((r) => !r.company.website);
-  if (parsed.filters.withWebsite) results = results.filter((r) => !!r.company.website);
-  if (parsed.filters.withoutBooking) results = results.filter((r) => r.opportunities.some((o) => o.id === "booking"));
-  results.sort((a, b) => b.score.score - a.score.score);
-  results = results.slice(0, limit);
+  // Los filtros se aplican sobre el análisis completo; después se recortan las oportunidades que viajan al navegador.
+  let analyzed = companies.map((c) => ({ c, a: analyzeCompany(c) }));
+  if (parsed.filters.withoutWebsite) analyzed = analyzed.filter((x) => !x.c.website);
+  if (parsed.filters.withWebsite) analyzed = analyzed.filter((x) => !!x.c.website);
+  if (parsed.filters.withoutBooking) analyzed = analyzed.filter((x) => x.a.opportunities.some((o) => o.id === "booking"));
+  analyzed.sort((x, y) => y.a.score.score - x.a.score.score);
+  const results = analyzed.slice(0, limit).map(({ c, a }) => ({ company: c, score: a.score, recommended: a.recommended, opportunities: a.opportunities.slice(0, 6), system: systemGap(a.opportunities) }));
 
   const sources = [google && "Google Maps", toggles.osm && osmR.status === "fulfilled" && "OpenStreetMap"].filter(Boolean) as string[];
   const costUsd = google ? +(google.calls * GOOGLE_CALL_USD).toFixed(3) : 0;
@@ -289,7 +304,7 @@ async function handleSearch(req: Request, env: Env, ctx: Ctx) {
       googleCalls: google?.calls ?? 0,
       attribution: sources.includes("OpenStreetMap") ? "© colaboradores de OpenStreetMap (ODbL)" : "",
       costUsd,
-      costEur: costUsd,
+      scoreDefinition: SCORE_DEFINITION,
     },
   });
 }
@@ -309,7 +324,7 @@ async function handleAnalyze(req: Request, env: Env, ctx: Ctx) {
     cacheHit = r.hit;
   }
   const analysis = analyzeCompany(company, audit);
-  return json({ analysis, meta: { cacheHit, rulesVersion: RULES_VERSION, costEur: 0 } });
+  return json({ analysis, meta: { cacheHit, rulesVersion: RULES_VERSION, costUsd: 0 } });
 }
 
 async function handleGoogle(req: Request, env: Env) {
@@ -460,6 +475,29 @@ export async function handle(req: Request, env: Env, ctx: Ctx): Promise<Response
         if (e instanceof ExternalError) return fail(e.status ?? 400, e.message);
         console.error(JSON.stringify({ level: "error", path: url.pathname, message: (e as Error).message }));
         return fail(500, "Error en el pipeline. Revisa los logs del Worker.");
+      }
+    }
+    if (url.pathname.startsWith("/api/practicas/")) {
+      const origin = req.headers.get("origin");
+      if (req.method === "POST" && origin && origin !== url.origin) return fail(403, "Origen no permitido.");
+      if (url.pathname === "/api/practicas/generate" && !aiLimiter.allow(`ai:${ip}`)) return fail(429, "Límite de generaciones por minuto alcanzado.");
+      try {
+        const body = req.method === "POST" ? await readJson(req) : {};
+        const toggles = await getToggles(env);
+        const d = deps(env, req, toggles);
+        const osm = toggles.osm ? (d.data as any).runOverpass ? (d.data as OsmProvider) : null : null;
+        return await handlePracticas(req, env, {
+          fetchImpl: d.fetchImpl,
+          geocode: (location) => d.data.geocodeArea({ location }),
+          osm,
+          userAgent: userAgent(env, req),
+          googleEnabled: toggles.googleSearch,
+          aiEnabled: toggles.ai,
+        }, url.pathname, body);
+      } catch (e) {
+        if (e instanceof ExternalError) return fail(e.status && e.status >= 400 && e.status < 600 ? e.status : 502, e.message, { service: e.service });
+        console.error(JSON.stringify({ level: "error", path: url.pathname, message: (e as Error).message }));
+        return fail(500, "Error en el módulo de prácticas. Revisa los logs del Worker.");
       }
     }
     if (req.method !== "POST") return fail(405, "Método no permitido.");

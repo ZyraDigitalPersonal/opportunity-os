@@ -3,6 +3,35 @@
 // Con facturación en el EEE, este contenido no se muestra junto al mapa.
 
 import { ExternalError, fetchWithTimeout } from "./http.js";
+import type { ReviewItem } from "./types.js";
+
+/** Reseña tal como la devuelve Places API (New). */
+export interface GReview {
+  rating?: number;
+  text?: { text?: string };
+  originalText?: { text?: string };
+  authorAttribution?: { displayName?: string; uri?: string };
+  relativePublishTimeDescription?: string;
+  publishTime?: string;
+  googleMapsUri?: string;
+}
+
+const httpsOnly = (u?: string) => (u && /^https:\/\//i.test(u) ? u : undefined);
+
+/** Reseñas completas con atribución (Google exige mostrar autor y enlace). */
+export function toReviewItems(reviews?: GReview[]): ReviewItem[] {
+  return (reviews ?? [])
+    .map((r) => ({
+      text: (r.originalText?.text ?? r.text?.text ?? "").trim(),
+      rating: r.rating,
+      author: r.authorAttribution?.displayName,
+      authorUri: httpsOnly(r.authorAttribution?.uri),
+      when: r.relativePublishTimeDescription,
+      publishTime: r.publishTime,
+      uri: httpsOnly(r.googleMapsUri),
+    }))
+    .filter((r) => r.text);
+}
 
 export interface GooglePlaceLive {
   placeId: string;
@@ -14,6 +43,8 @@ export interface GooglePlaceLive {
   phone?: string;
   businessStatus?: string;
   weekdayHours?: string[];
+  /** Hasta 5 reseñas completas (las que Google elige como más relevantes) */
+  reviews: ReviewItem[];
   fetchedAt: string;
 }
 
@@ -27,10 +58,11 @@ const FIELD_MASK = [
   "places.nationalPhoneNumber",
   "places.businessStatus",
   "places.regularOpeningHours.weekdayDescriptions",
+  "places.reviews",
 ].join(",");
 
-/** Precio de referencia: Text Search Enterprise, 35 US$ / 1.000 (1.000 gratis al mes). */
-export const GOOGLE_TEXT_SEARCH_USD = 0.035;
+/** Precio de referencia: Text Search Enterprise + Atmosphere (reseñas) ≈ 40 US$ / 1.000 (1.000 gratis al mes). */
+export const GOOGLE_TEXT_SEARCH_USD = 0.04;
 
 export async function fetchGooglePlace(
   apiKey: string,
@@ -70,6 +102,7 @@ export async function fetchGooglePlace(
     phone: p.nationalPhoneNumber,
     businessStatus: p.businessStatus,
     weekdayHours: p.regularOpeningHours?.weekdayDescriptions,
+    reviews: toReviewItems(p.reviews),
     fetchedAt: new Date().toISOString(),
   };
 }

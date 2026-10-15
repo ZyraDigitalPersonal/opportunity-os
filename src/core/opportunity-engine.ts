@@ -1,19 +1,25 @@
 // Opportunity Engine: EMPRESA → SEÑALES → SCORE (con motivos) → OPORTUNIDADES → SOLUCIÓN.
 // Determinista y sin IA: cada punto sale de una señal con su fuente y su nivel de confianza.
 
-import type { Analysis, Company, Opportunity, OpportunityScore, Priority, ScoreItem, Signal, WebAudit } from "./types.js";
+import type { Analysis, Company, ConfidenceLevel, Opportunity, OpportunityScore, Priority, ScoreItem, Signal, WebAudit } from "./types.js";
 import { resolveSector, type SectorProfile } from "./sectors.js";
 
-export const RULES_VERSION = "2026-10-01.2";
-const SLOW_MS = 3000;
+export const RULES_VERSION = "2026-10-15.1";
 
-const DIMENSION_CAPS: Record<ScoreItem["dimension"], number> = {
+/** Qué significa el porcentaje. Se muestra en la app para que nadie lo lea como «probabilidad de venta». */
+export const SCORE_DEFINITION =
+  "Opportunity Score (0-100): cuánto margen de mejora digital muestra el negocio según las señales detectadas (hasta 80 puntos: presencia web, reservas y automatización, atención al cliente), más lo contactable que es (hasta 10) y el encaje de su sector con la digitalización (hasta 10, inferido). No es una probabilidad de venta. La confianza indica cuánto respaldo tienen los datos.";
+
+export const DIMENSION_MAX = {
   "Presencia digital": 35,
   "Reservas y automatización": 30,
   "Atención al cliente": 15,
   "Potencial comercial": 10,
   "Encaje del sector": 10,
-};
+} as const;
+const SLOW_MS = 3000;
+
+const DIMENSION_CAPS: Record<ScoreItem["dimension"], number> = DIMENSION_MAX;
 
 export function extractSignals(c: Company, audit: WebAudit | undefined, sector: SectorProfile, now = new Date()): Signal[] {
   const s: Signal[] = [];
@@ -22,7 +28,7 @@ export function extractSignals(c: Company, audit: WebAudit | undefined, sector: 
   const prof = "Perfil del sector";
 
   if (c.website) s.push({ key: "has_website", label: "Tiene web registrada", confidence: "verificado", source: osm, evidence: c.website });
-  else s.push({ key: "no_website_found", label: "No se ha encontrado web en las fuentes consultadas", confidence: "inferido", source: osm, evidence: `${osm} no registra web; podría tenerla igualmente` });
+  else s.push({ key: "no_website_found", label: "No se ha encontrado web en las fuentes consultadas", confidence: "inferido", source: osm, evidence: `${c.alsoIn ? `Ni ${osm} ni ${c.alsoIn} registran` : `${osm} no registra`} web; podría tenerla igualmente` });
   if (c.phone) s.push({ key: "has_phone", label: "Teléfono publicado", confidence: "verificado", source: osm, evidence: c.phone });
   if (c.email) s.push({ key: "has_email", label: "Email de empresa publicado", confidence: "verificado", source: osm, evidence: c.email });
   if (c.openingHours) s.push({ key: "has_hours", label: "Horario publicado", confidence: "verificado", source: osm, evidence: c.openingHours });
@@ -30,13 +36,13 @@ export function extractSignals(c: Company, audit: WebAudit | undefined, sector: 
   if (c.whatsapp) s.push({ key: "osm_whatsapp", label: "WhatsApp publicado", confidence: "verificado", source: osm, evidence: c.whatsapp });
   if (c.rating !== undefined) {
     const ev = `${c.rating.toFixed(1)} ★ · ${c.reviews ?? 0} reseñas`;
-    if (c.rating < 4.2 && (c.reviews ?? 0) >= 5) s.push({ key: "low_rating", label: `Valoración mejorable en Google (${c.rating.toFixed(1)} ★)`, confidence: "verificado", source: "Google Maps", evidence: ev });
+    if (c.rating < 4.2 && (c.reviews ?? 0) >= 5) s.push({ key: "low_rating", label: `Valoración mejorable en Google (${c.rating.toFixed(1)} ★, por debajo de 4,2)`, confidence: "verificado", source: "Google Maps", evidence: ev });
     else s.push({ key: "google_rating", label: `Valoración en Google: ${c.rating.toFixed(1)} ★`, confidence: "verificado", source: "Google Maps", evidence: ev });
   }
   if (c.source === "Google" && (c.reviews ?? 0) < 25) s.push({ key: "few_reviews", label: `Pocas reseñas en Google (${c.reviews ?? 0})`, confidence: "verificado", source: "Google Maps" });
   if (c.source === "Google" && (c.reviews ?? 0) >= 150) s.push({ key: "busy_business", label: `Negocio con mucho movimiento (${c.reviews} reseñas)`, confidence: "verificado", source: "Google Maps" });
   const COMPLAINT_LABEL = { telefono: "Clientes se quejan de que no cogen el teléfono", esperas: "Clientes se quejan de esperas o problemas con citas/reservas", atencion: "Clientes se quejan de la atención o de que no responden mensajes" } as const;
-  for (const k of c.complaints ?? []) s.push({ key: `complaint_${k.type}`, label: COMPLAINT_LABEL[k.type], confidence: "verificado", source: "Reseñas de Google", evidence: `«${k.quote}»` });
+  for (const k of c.complaints ?? []) s.push({ key: `complaint_${k.type}`, label: COMPLAINT_LABEL[k.type], confidence: "verificado", source: "Reseñas de Google (muestra de hasta 5 reseñas)", evidence: `«${k.quote}»${k.author ? ` — ${k.author}` : ""}${k.when ? `, ${k.when}` : ""}` });
   if (c.reservation && /^(yes|required|recommended)$/.test(c.reservation)) s.push({ key: "takes_reservations", label: "Acepta o requiere reserva", confidence: "verificado", source: osm, evidence: `reservation=${c.reservation}` });
 
   if (audit) {
@@ -71,7 +77,43 @@ export function extractSignals(c: Company, audit: WebAudit | undefined, sector: 
   return s;
 }
 
-export function computeScore(signals: Signal[], sector: SectorProfile, audited: boolean): OpportunityScore {
+/**
+ * Confianza de la evaluación: cuánto respaldo tienen los datos. No suma ni resta puntos al score.
+ * Se reduce cuando la web existe pero no se ha revisado o cuando solo hay datos de OpenStreetMap.
+ */
+export function scoreConfidence(c: Pick<Company, "source" | "alsoIn" | "website" | "rating">, audited: boolean, signals: Signal[]): { level: ConfidenceLevel; reasons: string[] } {
+  let pts = 0;
+  const reasons: string[] = [];
+  if (c.source === "Google") {
+    pts += 2;
+    reasons.push("Datos de Google Maps (fuente amplia y actualizada)");
+  } else reasons.push("Solo OpenStreetMap: puede faltar la web, el teléfono o las redes del negocio");
+  if (c.alsoIn) {
+    pts += 1;
+    reasons.push(`Coincide en dos fuentes (también en ${c.alsoIn})`);
+  }
+  if (c.website) {
+    const unreachable = signals.some((x) => x.key === "web_unreachable" || x.key === "robots_blocked");
+    if (audited && !unreachable) {
+      pts += 2;
+      reasons.push("Web revisada");
+    } else if (audited) reasons.push("La web no se pudo revisar del todo (no responde o no permite análisis)");
+    else {
+      pts -= 2;
+      reasons.push("Tiene web y aún no se ha revisado: score provisional");
+    }
+  } else if (c.source === "Google") {
+    pts += 1;
+    reasons.push("Google Maps no registra web para este negocio");
+  }
+  if (c.rating !== undefined) {
+    pts += 1;
+    reasons.push("Valoración y reseñas disponibles");
+  }
+  return { level: pts >= 4 ? "alta" : pts >= 2 ? "media" : "baja", reasons };
+}
+
+export function computeScore(signals: Signal[], sector: SectorProfile, audited: boolean, company?: Company): OpportunityScore {
   const has = (k: string) => signals.some((x) => x.key === k);
   const items: ScoreItem[] = [];
   const add = (dimension: ScoreItem["dimension"], points: number, signalKey: string, reason?: string) => {
@@ -127,7 +169,18 @@ export function computeScore(signals: Signal[], sector: SectorProfile, audited: 
   }
   const score = Math.min(100, Object.values(byDimension).reduce((a, b) => a + b, 0));
   items.sort((a, b) => b.points - a.points);
-  return { score, items, byDimension, partial: !audited && has("has_website") };
+  const total = items.reduce((a, b) => a + b.points, 0);
+  const verified = items.filter((i) => i.confidence === "verificado").reduce((a, b) => a + b.points, 0);
+  const conf = company ? scoreConfidence(company, audited, signals) : { level: "media" as ConfidenceLevel, reasons: [] };
+  return {
+    score,
+    items,
+    byDimension,
+    partial: !audited && has("has_website"),
+    confidence: conf.level,
+    confidenceReasons: conf.reasons,
+    verifiedShare: total ? Math.round((verified / total) * 100) / 100 : 0,
+  };
 }
 
 const PRIORITY_ORDER: Record<Priority, number> = { alta: 0, media: 1, baja: 2 };
@@ -239,7 +292,7 @@ export function detectOpportunities(signals: Signal[], sector: SectorProfile, c:
       id: "reviews",
       title: "Reseñas y reputación en Google",
       priority: has("low_rating") ? "media" : "baja",
-      problem: has("low_rating") ? `Valoración por debajo de la media del sector (${c.rating?.toFixed(1)} ★): pierde clientes que comparan en Google Maps.` : `Pocas reseñas en Google (${c.reviews ?? 0}): poca confianza frente a la competencia.`,
+      problem: has("low_rating") ? `Valoración de ${c.rating?.toFixed(1)} ★ en Google (por debajo de 4,2): puede perder clientes que comparan en Google Maps.` : `Pocas reseñas en Google (${c.reviews ?? 0}): poca confianza frente a la competencia.`,
       solution: "Petición automática de reseña tras cada servicio (WhatsApp/SMS), respuesta a reseñas con IA y ficha de Google optimizada.",
       basedOn: [has("low_rating") ? "low_rating" : "few_reviews"],
     });
@@ -275,7 +328,7 @@ export function analyzeCompany(c: Company, audit?: WebAudit, now = new Date()): 
   const sector = resolveSector(c.sectorId);
   if (!sector) throw new Error(`Sector desconocido: ${c.sectorId}`);
   const signals = extractSignals(c, audit, sector, now);
-  const score = computeScore(signals, sector, !!audit);
+  const score = computeScore(signals, sector, !!audit, c);
   const opportunities = detectOpportunities(signals, sector, c);
   return { company: c, signals, score, opportunities, recommended: recommend(opportunities), audit };
 }

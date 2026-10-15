@@ -1,4 +1,4 @@
-# OpportunityOS · v0.2
+# OpportunityOS · v0.3
 
 Busca negocios por sector y zona, revisa su web pública y calcula un **Opportunity Score** con los motivos de cada punto, las oportunidades detectadas y la solución recomendada. Desde el perfil de cada empresa genera propuestas, emails, mensajes de WhatsApp o LinkedIn y guiones de llamada con IA.
 
@@ -21,6 +21,19 @@ Funciona en **Cloudflare Workers**, sin base de datos todavía. El frontend es T
 | Acceso con contraseña, sesión firmada, límite de peticiones, CSP, protección SSRF y CSRF | Funciona | — |
 
 Todavía no incluye CRM, listas guardadas, asistente con herramientas, dashboard ni Oportunidades B2B. Esas partes necesitan la base de datos (Postgres) y llegan en las Entregas B–D del plan.
+
+## Prácticas y empleo formativo (nuevo)
+
+Sección para estudiantes: perfil, búsqueda local/nacional/remota, investigación de cada empresa con evidencias
+(cita + enlace), puntuación separada en **encaje**, **viabilidad** y **confianza**, organizador de candidaturas
+y asistente para redactar correos y candidaturas. Detalle técnico en [`docs/PRACTICAS.md`](docs/PRACTICAS.md).
+
+Secretos opcionales para ofertas publicadas: `ADZUNA_APP_ID` + `ADZUNA_APP_KEY` (developer.adzuna.com) y
+`JOOBLE_API_KEY` (jooble.org/api/about). Sin ellos el módulo funciona con Google Maps, OpenStreetMap y enlaces de
+búsqueda manual. Variables: `PLAN` (individual | avanzado | centro) y `PRACTICAS_GOOGLE_MAX_CALLS` (6).
+
+Recomendado: `GOOGLE_MAPS_BROWSER_KEY`, una clave aparte solo con Maps JavaScript API restringida a tu dominio.
+Sin ella, la clave del servidor llega al navegador para pintar el mapa.
 
 ## Publicarlo (elige una opción)
 
@@ -54,7 +67,7 @@ Al terminar, wrangler muestra la URL: `https://opportunity-os.<tu-subdominio>.wo
 ```bash
 cp .dev.vars.example .dev.vars   # rellena los valores
 npm run dev                      # http://localhost:8787
-npm test                         # 30 tests: parser, auditoría, score, API, seguridad
+npm test                         # 71 tests: parser, auditoría, score, prácticas, API, seguridad
 npm run typecheck
 ```
 

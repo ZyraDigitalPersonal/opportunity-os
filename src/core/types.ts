@@ -44,7 +44,27 @@ export interface Company {
 
 export interface Complaint {
   type: "telefono" | "esperas" | "atencion";
+  /** Fragmento donde aparece la queja (puede estar recortado, con «…») */
   quote: string;
+  /** Texto completo de la reseña (solo en vivo; nunca se guarda en servidor) */
+  text?: string;
+  rating?: number;
+  author?: string;
+  /** «hace 3 meses» (texto de Google) */
+  when?: string;
+  /** Enlace a la reseña o a su autor en Google Maps */
+  uri?: string;
+}
+
+/** Reseña de Google mostrada en vivo, completa y con atribución (no se guarda). */
+export interface ReviewItem {
+  text: string;
+  rating?: number;
+  author?: string;
+  authorUri?: string;
+  when?: string;
+  publishTime?: string;
+  uri?: string;
 }
 
 export interface Signal {
@@ -63,12 +83,19 @@ export interface ScoreItem {
   signalKey: string;
 }
 
+export type ConfidenceLevel = "alta" | "media" | "baja";
+
 export interface OpportunityScore {
   score: number;
   items: ScoreItem[];
   byDimension: Record<string, number>;
-  /** true si solo se usaron datos de OSM (sin auditar la web) */
+  /** true si el negocio tiene web y todavía no se ha revisado: el score es provisional */
   partial: boolean;
+  /** Cuánto respaldo tienen los datos usados (no cambia el score) */
+  confidence: ConfidenceLevel;
+  confidenceReasons: string[];
+  /** Puntos que salen de hechos verificados frente al total */
+  verifiedShare: number;
 }
 
 export type Priority = "alta" | "media" | "baja";
